@@ -6,11 +6,22 @@ export interface Teacher {
   email: string | null;
   role: string;
   department: string | null;
+  // the specific school this teacher is assigned to. in single-school mode this
+  // matches the top-level school; in district mode it's the feeder school
+  // (williston central, hinesburg community, etc.).
+  schoolName: string | null;
+  schoolNcesId: string | null;
   phoneExtension: string | null;
   linkedinUrl: string | null;
   sources: DataSource[];
   confidence: ConfidenceScore;
+  // 1-5 affinity for Hack Club values (project-based CS / maker / engineering).
+  // 5 = CS/coding/software teacher, 1 = math/non-tinker teacher. computed from
+  // role + department keywords by the validator.
+  hackerScore: HackerScore;
 }
+
+export type HackerScore = 1 | 2 | 3 | 4 | 5;
 
 export interface SchoolInfo {
   name: string;
@@ -19,6 +30,15 @@ export interface SchoolInfo {
   phone: string | null;
   district: string | null;
   ncesId: string | null;
+}
+
+// district-level info — populated when the scraped url is a district site
+// covering multiple schools rather than a single school.
+export interface DistrictInfo {
+  name: string;
+  leaId: string | null;
+  url: string;
+  officeAddress: Address | null;
 }
 
 export interface Address {
@@ -39,7 +59,10 @@ export type DataSource =
 export type ConfidenceScore = 1 | 2 | 3 | 4 | 5;
 
 export interface ScrapeResult {
-  school: SchoolInfo;
+  // district is null for single-school scrapes, populated for district sites.
+  district: DistrictInfo | null;
+  // always non-empty: one school for single-school mode, multiple for districts.
+  schools: SchoolInfo[];
   teachers: Teacher[];
   metadata: {
     scrapedAt: string;
@@ -57,12 +80,33 @@ export interface RawTeacherData {
   role?: string;
   department?: string;
   phone?: string;
+  // the specific school this teacher works at, when the site covers multiple
+  // schools (typical for district sites). left empty for single-school sites.
+  assignedSchool?: string;
+}
+
+// raw shape for district/school site info returned by the scraper ai pass
+export interface RawSiteInfo {
+  siteType: "district" | "school";
+  // the primary name: district name when siteType is district, school name otherwise.
+  name: string | null;
+  // primary mailing address: district office in district mode, school in school mode.
+  address: string | null;
+  // list of feeder schools when siteType is district; ignored for school mode.
+  schools?: string[];
+  // when a shared campus hosts multiple schools under one umbrella name (e.g.
+  // "Williston Schools" = "Williston Central School" + "Allen Brook School"),
+  // record the grouping. the federal NCES data often lists only the umbrella,
+  // so we use these mappings as a matcher fallback when a specific school
+  // can't be found directly in the NCES roster.
+  schoolGroups?: Array<{ umbrella: string; members: string[] }>;
 }
 
 // nces api response shape (subset of fields we care about)
 export interface NCESSchoolRecord {
   school_name: string;
   ncessch: string;
+  leaid: string;
   street_mailing: string;
   city_mailing: string;
   state_mailing: string;
@@ -82,6 +126,5 @@ export interface NCESSchoolRecord {
 export interface ScrapeConfig {
   schoolUrl: string;
   enableLinkedin: boolean;
-  linkedinProfileId?: string;
   outputPath: string;
 }

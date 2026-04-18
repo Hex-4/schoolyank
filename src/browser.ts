@@ -1,15 +1,71 @@
 // ── browser-use session management ──
 
 import { BrowserUse } from "browser-use-sdk/v3";
+import type { z } from "zod";
 
 export interface SessionInfo {
   id: string;
   liveUrl: string;
 }
 
+export interface ProfileInfo {
+  id: string;
+  name: string | null;
+  cookieDomains: string[] | null;
+  lastUsedAt: string | null;
+}
+
+// browser-use model tiers — see node_modules/browser-use-sdk/dist/v3.d.ts (BuModel).
+// wider aliases ("bu-mini" etc.) also valid; we use the direct model names for clarity.
+// NOTE: model is a per-run parameter on client.run(), not a session-level attribute.
+export type BrowserModel =
+  | "gemini-3-flash"
+  | "claude-sonnet-4.6"
+  | "claude-opus-4.6"
+  | "gpt-5.4-mini";
+
 /** create a browser-use client (picks up BROWSER_USE_API_KEY from env) */
 export function createClient(): BrowserUse {
   return new BrowserUse();
+}
+
+/** create a new browser profile */
+export async function createProfile(
+  client: BrowserUse,
+  name: string,
+): Promise<ProfileInfo> {
+  const profile = await client.profiles.create({ name });
+  return {
+    id: profile.id,
+    name: profile.name ?? null,
+    cookieDomains: profile.cookieDomains ?? null,
+    lastUsedAt: profile.lastUsedAt ?? null,
+  };
+}
+
+/** list existing profiles */
+export async function listProfiles(client: BrowserUse): Promise<ProfileInfo[]> {
+  const response = await client.profiles.list();
+  return response.items.map((p) => ({
+    id: p.id,
+    name: p.name ?? null,
+    cookieDomains: p.cookieDomains ?? null,
+    lastUsedAt: p.lastUsedAt ?? null,
+  }));
+}
+
+/** get a profile by id */
+export async function getProfile(
+  client: BrowserUse,
+  profileId: string,
+): Promise<ProfileInfo> {
+  const profile = await client.profiles.get(profileId);
+  return {
+    id: profile.id,
+    name: profile.name ?? null,
+    cookieDomains: profile.cookieDomains ?? null,
+    lastUsedAt: profile.lastUsedAt ?? null,
+  };
 }
 
 /** spin up a new browser session, optionally tied to a linkedin profile */
@@ -24,26 +80,151 @@ export async function createSession(
   return { id: session.id, liveUrl: session.liveUrl ?? "" };
 }
 
-/** run a task inside an existing session, optionally streaming messages */
+// ── task running ────────────────────────────────────────────────────────────
+
+interface RunTaskOptions {
+  onMessage?: (msg: string) => void;
+  /** browser-use model tier — default is claude-sonnet-4.6 server-side */
+  model?: BrowserModel;
+}
+
+/**
+ * browser-use agent messages that are internal chatter (its own python
+ * scratchpad, file I/O about output.json, etc.) rather than useful progress
+ * signal. filter them at the stream boundary so they never propagate upward
+ * into the spinner. "Output saved to output.json" is particularly misleading
+ * because users think that's THEIR output file (it's actually the agent's
+ * internal python scratchpad — we capture data via the structured-output
+ * schema, not the agent's file system).
+ */
+const NOISY_AGENT_PATTERNS = [
+  /\boutput(\.json)?\b/i,
+  /\bsave_output_json\b/i,
+  /^\s*ran python\b/i,
+  /^\s*running python\b/i,
+  /^\s*python:?\s*$/i,
+  /^\s*saved (to|in) /i,
+  /\bwritten to\b/i,
+  /\bscratchpad\b/i,
+];
+
+function isNoisyAgentMessage(summary: string): boolean {
+  return NOISY_AGENT_PATTERNS.some((re) => re.test(summary));
+}
+
+/** format a browser-use stream message into a short, terminal-friendly line */
+function formatBrowserMessage(summary: string): string {
+  const termWidth = process.stdout.columns ?? 80;
+  const maxLen = Math.max(40, termWidth - 10);
+  const cleaned = summary.trim().replace(/\s+/g, " ");
+  if (cleaned.length <= maxLen) return cleaned;
+  return cleaned.slice(0, maxLen - 1) + "…";
+}
+
+/** the sdk types output as unknown | null — coerce into a usable string here */
+function coerceOutput(output: unknown): string {
+  if (output == null) return "";
+  if (typeof output === "string") return output;
+  try {
+    return JSON.stringify(output);
+  } catch {
+    return String(output);
+  }
+}
+
+/** drive the message stream with dedupe, noise-filter, and truncation */
+async function drainMessages(
+  run: AsyncIterable<{ role: string; summary?: string }>,
+  onMessage: (msg: string) => void,
+): Promise<void> {
+  let last = "";
+  for await (const msg of run) {
+    const summary = (msg.summary ?? "").trim();
+    if (!summary || summary === last) continue;
+    last = summary;
+    // drop agent-internal chatter (file I/O about its scratchpad, etc.)
+    // before it can reach the spinner. the user wants actionable progress,
+    // not "Output saved to output.json" which refers to the agent's own
+    // intermediate file rather than our schoolyank CSV.
+    if (isNoisyAgentMessage(summary)) continue;
+    onMessage(formatBrowserMessage(summary));
+  }
+}
+
+/**
+ * run a task inside an existing session.
+ * returns the agent's free-form text output as a string.
+ */
 export async function runTask(
   client: BrowserUse,
   sessionId: string,
   prompt: string,
-  onMessage?: (msg: string) => void,
+  options: RunTaskOptions = {},
 ): Promise<string> {
+  const { onMessage, model } = options;
+
   try {
     if (onMessage) {
-      const run = client.run(prompt, { sessionId });
+      const run = client.run(prompt, {
+        sessionId,
+        ...(model && { model }),
+      });
 
-      for await (const msg of run) {
-        onMessage(`[${msg.role}] ${msg.summary}`);
-      }
-
-      return run.result!.output;
+      await drainMessages(run, onMessage);
+      return coerceOutput(run.result?.output);
     }
 
-    const result = await client.run(prompt, { sessionId });
-    return result.output;
+    const result = await client.run(prompt, {
+      sessionId,
+      ...(model && { model }),
+    });
+    return coerceOutput(result.output);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`browser task failed: ${message}`);
+  }
+}
+
+/**
+ * run a task with a zod schema for structured output — the agent is forced
+ * to return data conforming to the schema, eliminating the "agent saves data
+ * to a file and returns prose" failure mode that plagues free-form tasks.
+ */
+export async function runTaskStructured<T extends z.ZodType>(
+  client: BrowserUse,
+  sessionId: string,
+  prompt: string,
+  schema: T,
+  options: RunTaskOptions = {},
+): Promise<z.output<T>> {
+  const { onMessage, model } = options;
+
+  try {
+    if (onMessage) {
+      const run = client.run(prompt, {
+        sessionId,
+        schema,
+        ...(model && { model }),
+      });
+
+      await drainMessages(run, onMessage);
+      // structured runs return typed data in run.result.output
+      const out = run.result?.output;
+      if (out == null) {
+        throw new Error("structured task returned null output");
+      }
+      return out as z.output<T>;
+    }
+
+    const result = await client.run(prompt, {
+      sessionId,
+      schema,
+      ...(model && { model }),
+    });
+    if (result.output == null) {
+      throw new Error("structured task returned null output");
+    }
+    return result.output as z.output<T>;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     throw new Error(`browser task failed: ${message}`);

@@ -37,6 +37,57 @@ interactive cli will prompt for:
 
 output csv lands in `./output/`.
 
+## linkedin enrichment
+
+linkedin enrichment requires a browser-use profile with linkedin authentication. the cli guides you through setup.
+
+### first-time setup
+
+when you enable linkedin enrichment for the first time, you'll need to sync your linkedin cookies:
+
+1. log into linkedin in a local chromium-based browser (chrome, edge, etc.)
+
+2. schoolyank will show you the sync command:
+   ```bash
+   curl -fsSL https://browser-use.com/profile.sh | sh
+   ```
+
+3. run it in a separate terminal - the script will prompt for your browser-use API key
+
+4. paste your API key (schoolyank shows it for you)
+
+5. select the browser profile where you're logged into linkedin
+
+6. return to schoolyank and confirm the sync is complete
+
+7. select your newly synced profile from the list
+
+### after first setup
+
+once you've synced a profile, schoolyank remembers it:
+
+```
+◆ schoolyank
+
+│ school website url: https://example.edu
+│ enable linkedin enrichment? yes
+│
+◇ use saved linkedin profile (linkedin-profile)? yes
+│
+◇ starting scrape...
+```
+
+to use a different profile or re-sync, select "sync new profile" when prompted.
+
+profiles are cached in `profiles/config.json`.
+
+### how it works
+
+- the sync script opens your local browser where you control the login
+- cookies are uploaded to browser-use's cloud and stored in a profile
+- the agent uses your linkedin session to search for teacher profiles
+- one profile can be reused across multiple runs
+
 ## csv columns
 
 | column | description |

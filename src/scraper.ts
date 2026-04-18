@@ -1,8 +1,14 @@
 // ── phase 1: school website scraping via browser-use ──
 
-import type { RawTeacherData } from "./types";
-import { createClient, createSession, runTask, stopSession } from "./browser";
-import { askJson } from "./ai";
+import { z } from "zod";
+import type { RawTeacherData, RawSiteInfo } from "./types";
+import {
+  createClient,
+  createSession,
+  runTask,
+  runTaskStructured,
+  stopSession,
+} from "./browser";
 
 // comprehensive stem subject keywords fed into the browser-use prompts
 const STEM_SUBJECTS = [
@@ -28,113 +34,307 @@ const EXCLUSIONS = [
   "exercise science", "sports science", "science of cooking",
 ].join(", ");
 
+// ── zod schemas for structured agent output ────────────────────────────────
+
+const SiteInfoSchema = z.object({
+  siteType: z.enum(["district", "school"]),
+  name: z.string().nullable(),
+  address: z.string().nullable(),
+  schools: z.array(z.string()).default([]),
+  // optional: umbrella → members map for shared-campus groupings. lets the
+  // matcher fall back to the federal umbrella record when a specific member
+  // school isn't registered separately in NCES.
+  schoolGroups: z
+    .array(
+      z.object({
+        umbrella: z.string(),
+        members: z.array(z.string()),
+      }),
+    )
+    .default([]),
+});
+
+const TeacherSchema = z.object({
+  name: z.string(),
+  email: z.string().nullable(),
+  role: z.string().nullable(),
+  department: z.string().nullable(),
+  phone: z.string().nullable(),
+  assignedSchool: z.string().nullable(),
+});
+
+const TeachersSchema = z.object({
+  teachers: z.array(TeacherSchema),
+});
+
+// follow-up task when classify returns a plural "X Schools" we can't split
+// from the top-level page alone. agent drills into the umbrella's landing page
+// and enumerates its member schools.
+const UmbrellaMembersSchema = z.object({
+  isUmbrella: z.boolean(),
+  members: z.array(z.string()).default([]),
+});
+
 // ── browser-use task prompts ──
 
-function promptFindStaffDirectory(schoolUrl: string): string {
+function promptClassifySite(schoolUrl: string): string {
   return `Go to ${schoolUrl}.
 
-Your goal is to find the staff directory, faculty page, or teacher listing on this school website.
+Your task: determine whether this URL is a SINGLE SCHOOL site or a SCHOOL DISTRICT site covering multiple schools, and extract identifying information about it.
 
-Navigation strategy:
-1. Check the main navigation bar for links labeled: "Staff", "Faculty", "Our Team", "Directory", "Teachers", "Staff Directory", "Faculty & Staff", "Meet Our Staff", "About Us" (which often has a sub-link to staff).
-2. Hover over or click menu items to reveal sub-menus and dropdowns — staff pages are often nested under "About", "Our School", or "Community".
-3. Check the footer for quick-links to a staff directory.
-4. If the school site is part of a district website, look for a section specific to this school first.
+━━ CLASSIFICATION ━━
 
-Also look for department-specific pages for Science, Math, STEM, Technology, or Engineering departments — these sometimes have their own staff listings separate from the main directory.
+DISTRICT signals (any one is strong evidence):
+- Name contains "District", "Unified School District", "Public Schools", "Consolidated Schools", "School Corporation", "ISD", "USD", "Supervisory Union", "Education Service District", "Regional School Unit"
+- A "Schools" menu, dropdown, or footer section lists 2+ schools by name
+- The site covers multiple grade bands (e.g. elementary AND middle AND high school)
+- Multiple principals listed, multiple street addresses, multiple phone numbers
 
-Report back:
-- The URL(s) of any staff/faculty directory pages you found.
-- The URL(s) of any STEM department-specific pages.
-- If you couldn't find a staff directory, say so clearly.`;
+SINGLE SCHOOL signals (all should be true):
+- Site is branded around exactly one school (one logo, one mascot, one "About our school" voice)
+- One principal, one address, one main phone number
+- Staff directory is that school only
+
+━━ NAME EXTRACTION ━━
+
+Use the OFFICIAL, FULL name as it appears in the footer, "Contact Us" page, or "About" page. Do NOT use shorthand from the navigation bar.
+- If the nav says "CVU" but the footer says "Champlain Valley Union High School" → return "Champlain Valley Union High School"
+- District names: use the full legal name including any number suffix (e.g. "Champlain Valley Unified Union School District #56")
+
+━━ ADDRESS ━━
+
+Full MAILING address: street, city, state, zip. Usually in the footer.
+- District site → district OFFICE address (central office / administration building)
+- Single school → that school's street address
+
+━━ LISTING SCHOOLS (DISTRICT ONLY) ━━
+
+List EVERY individual school. Sources: the "Schools" or "Our Schools" menu, the staff directory's school filter, footer quick-links.
+
+CRITICAL rules for school names:
+- OFFICIAL FULL NAME for each, not abbreviations
+- If a campus hosts multiple schools under an umbrella (e.g. "Williston Schools" = "Williston Central School" (5-8) + "Allen Brook School" (K-4)), list them SEPARATELY. Never return a grouped/umbrella name. If in doubt about whether a label is an umbrella, click into it to check.
+- Each school is one entry even if they share a building, phone, or website
+- Do NOT include grade-level labels as schools ("Elementary", "Middle School", "High School" are not names by themselves)
+
+━━ SHARED-CAMPUS GROUPINGS ━━
+
+If two or more schools share one campus/building under an UMBRELLA LABEL (e.g. "Williston Schools" on the nav = "Williston Central School" + "Allen Brook School" physically), you must separate them:
+
+1. The "schools" array contains ONLY the specific member schools (e.g. "Williston Central School", "Allen Brook School"). DO NOT include the umbrella label here.
+2. The "schoolGroups" array records the umbrella→members mapping: { umbrella: "Williston Schools", members: ["Williston Central School", "Allen Brook School"] }
+
+Critical: if you list the umbrella in "schools", downstream teachers will be assigned to the umbrella instead of their specific school, collapsing our data. Umbrella names belong ONLY in schoolGroups[].umbrella, never in schools[].
+
+If no shared-campus groupings exist, leave schoolGroups empty.
+
+━━ OUTPUT ━━
+
+Return your answer as structured JSON matching the required schema:
+- siteType: "district" or "school"
+- name: the official full name (null only if you genuinely cannot find one)
+- address: full mailing address (null only if unavailable)
+- schools: array of school names — required and non-empty when siteType is "district"; empty array when siteType is "school"
+- schoolGroups: array of {umbrella, members} for shared campuses; empty array if none
+
+Do NOT save output to a file. Do NOT use save_output_json. Return the JSON data as your final response via the structured output format.`;
 }
 
-function promptExtractTeachers(): string {
-  return `Navigate to the staff directory pages you found in the previous step. Extract ALL teachers whose subject, role, title, or department relates to STEM.
+function promptUmbrellaMembers(
+  umbrellaLabel: string,
+  districtName: string | null,
+): string {
+  return `The district website lists "${umbrellaLabel}" as a school. The plural "Schools" label strongly suggests this is an UMBRELLA covering multiple real schools that share a campus (e.g. "Williston Schools" covers both "Williston Central School" (5-8) and "Allen Brook School" (K-4)).
 
-STEM subjects to look for: ${STEM_SUBJECTS}.
+Your task: navigate to the "${umbrellaLabel}" page${districtName ? ` on the ${districtName} website` : ""} and determine whether it is a single school or an umbrella for multiple schools, and if an umbrella, list the individual member schools.
 
-EXCLUDE anyone whose role matches these non-STEM subjects: ${EXCLUSIONS}.
+━━ INVESTIGATION STEPS ━━
+1. Click into "${umbrellaLabel}" from the Schools / Our Schools menu, or navigate to its landing page.
+2. Look for sub-pages, tabs, or sections naming individual member schools (e.g. "Williston Central School (5-8)" and "Allen Brook School (K-4)").
+3. Check staff directories under this umbrella — distinct school filters reveal member schools.
+4. Check the district's main Schools menu — members are often linked there too, as nested items.
 
-For each STEM teacher, extract:
-- full name (first and last name)
-- email address (look for mailto: links, on-page text, or contact info sections)
-- role / title / position (e.g. "AP Physics Teacher", "Math Department Chair")
-- department (e.g. "Science", "Mathematics", "STEM")
-- phone extension (if listed)
+━━ OUTPUT ━━
+- isUmbrella: true if "${umbrellaLabel}" covers 2+ distinct member schools; false if it is a single school just named in the plural.
+- members: the OFFICIAL FULL NAMES of each member school (e.g. "Williston Central School", "Allen Brook School"). Empty array if isUmbrella is false.
 
-Important instructions:
-- Handle pagination: if the directory spans multiple pages, click "Next", "Load More", or page number links to visit ALL pages.
-- If teachers are organized by department, visit each relevant STEM department page.
-- If the directory shows cards or tiles, click into individual teacher profiles if they exist — emails are sometimes only on the detail page.
-- If teachers are listed in a table, scan every row.
-- Include department chairs, coordinators, and lead teachers if they teach STEM subjects.
-- When in doubt about whether someone teaches STEM, include them — we'll filter later.
-
-Return the data as a JSON array of objects with these keys: name, email, role, department, phone.
-Example: [{"name": "Jane Smith", "email": "jsmith@school.edu", "role": "AP Chemistry Teacher", "department": "Science", "phone": "x1234"}]`;
+Do NOT save output to a file. Return structured JSON.`;
 }
 
-function promptGetSchoolInfo(): string {
-  return `Find this school's official name and mailing address.
+function promptFindStaffDirectory(siteType: "district" | "school"): string {
+  const commonLabels = `"Staff", "Faculty", "Our Team", "Our Staff", "Directory", "Teachers", "Staff Directory", "Faculty & Staff", "Meet Our Staff", "Employee Directory", "Who's Who", "Our People"`;
 
-Where to look:
-1. The page footer — most school websites display the address in the footer on every page.
-2. A "Contact Us" or "Contact" page.
-3. An "About" or "About Us" page.
+  if (siteType === "district") {
+    return `Find every staff directory page on this district website. A district typically has MULTIPLE directories — one per school, plus possibly a district-wide one.
 
-Extract:
-- The school's full official name (e.g. "Lincoln High School", not just "Lincoln")
-- The complete mailing address: street, city, state, and zip code.
+━━ SEARCH STRATEGY ━━
 
-Return the data as JSON with keys: name, address.
-Example: {"name": "Lincoln High School", "address": "1234 Main St, Springfield, IL 62701"}`;
+1. Top navigation: look for ${commonLabels}. District-wide directories often live here.
+2. The "Schools" menu/section: for EACH school, visit its landing page and find its OWN staff directory.
+3. Look for "Select a School" or school-picker widgets — these filter a district-wide table by school.
+4. Footer quick-links — directories are often duplicated there.
+5. Department-specific pages (Math, Science, STEM) sometimes list cross-school teachers.
+
+━━ WHAT TO REPORT ━━
+
+For every staff page you found, report:
+- The URL
+- Which school it covers (full official name), OR "district-wide" for cross-school pages
+- Structure notes (paginated, filterable by department/school, cards vs table)
+
+If you find nothing, say so and list the district's schools by name.
+
+Do NOT save your output to a file. This is a navigation-reporting step — just describe what you found in plain text.`;
+  }
+
+  return `Find the staff directory, faculty page, or teacher listing on this school website.
+
+━━ SEARCH STRATEGY ━━
+
+1. Top nav: ${commonLabels}
+2. Hover/expand every top-level menu — staff pages are commonly nested under "About", "Our School", "Community", or "Parents".
+3. Footer quick-links.
+4. Department-specific pages for Science, Math, STEM, Computer Science, Engineering.
+
+━━ WHAT TO REPORT ━━
+
+- URL(s) of every staff/faculty directory page
+- URL(s) of any STEM department-specific teacher listings
+- Structure notes (paginated? filterable? tabs?)
+- If no directory, say so clearly.
+
+Do NOT save output to a file — describe what you found as your response.`;
 }
 
-// ── ai extraction helpers ──
+function promptExtractTeachers(
+  siteType: "district" | "school",
+  knownSchools: string[],
+): string {
+  const districtGuidance = siteType === "district"
+    ? `
+━━ DISTRICT MODE — PER-TEACHER SCHOOL IS MANDATORY ━━
 
-const EXTRACTION_SYSTEM =
-  "Extract structured data from the following browser agent output. Return valid JSON only.";
+For EVERY teacher you extract, assignedSchool must be set to the teacher's specific school.
 
-async function extractTeachers(rawOutput: string): Promise<RawTeacherData[]> {
-  return askJson<RawTeacherData[]>(
-    EXTRACTION_SYSTEM,
-    `The following is the output from a browser agent that was asked to find STEM teachers on a school website. Extract an array of teacher objects from it.
+Known schools in this district:
+${knownSchools.map((s) => `  - ${s}`).join("\n")}
 
-Each object should have: name (string), email (string or null), role (string or null), department (string or null), phone (string or null).
+How to determine the assigned school:
+1. If the directory is organized by school (headers, tabs, filters), that's the school.
+2. If there's a "Building"/"Location"/"School" column or field, use it.
+3. If a profile page lists "School: X", use X.
+4. Fallback: grade-level or role hints.
 
-Browser agent output:
-${rawOutput}`,
-  );
-}
+Naming rules:
+- assignedSchool MUST match one of the known schools EXACTLY (copy/paste the name)
+- If the site shows an abbreviation (e.g. "CVU") and the known list has the full name, return the FULL name
+- If the site shows an umbrella (e.g. "Williston Schools") and the known list has separate entries ("Williston Central School" + "Allen Brook School"), pick the specific school using grade range / role / section. Never return the umbrella.
+- Never put a district name, department name, or grade level into assignedSchool
+`
+    : `
+━━ SINGLE SCHOOL MODE ━━
 
-async function extractSchoolInfo(
-  rawOutput: string,
-): Promise<{ name: string | null; address: string | null }> {
-  return askJson<{ name: string | null; address: string | null }>(
-    EXTRACTION_SYSTEM,
-    `The following is the output from a browser agent that was asked to find a school's name and address. Extract the school name and address from it.
+All teachers belong to the one school. Set assignedSchool to null for every teacher.
+`;
 
-Return JSON with keys: name (string or null), address (string or null).
+  return `Visit the staff directory pages you found. Extract EVERY teacher whose subject, role, title, or department relates to STEM.
 
-Browser agent output:
-${rawOutput}`,
-  );
+━━ INCLUDE ━━
+
+STEM subjects: ${STEM_SUBJECTS}
+
+Also include even without "teacher" in the title:
+- Department chairs/heads/leads in STEM departments
+- STEM coordinators, coaches, specialists, interventionists
+- Digital learning leaders, tech integrators (if they teach students)
+- Long-term substitutes for STEM subjects
+- Applied/vocational STEM (robotics, design technology, CAD, maker labs)
+
+━━ EXCLUDE ━━
+
+Not STEM: ${EXCLUSIONS}
+
+Also exclude:
+- Support staff who don't teach (custodians, secretaries, bus drivers, food services)
+- Administrators with no subject teaching role (principals, vice principals, counselors)
+- General K-5 classroom teachers who don't have a STEM specialization
+- Librarians (unless explicitly a "library technology integrator")
+${districtGuidance}
+━━ FIELD RULES ━━
+
+- name: full name (first + last). Strip titles (Dr., Mr., Mrs., Ms.) and postnominals (Jr., PhD, MEd).
+- email: exact email address — mailto: links, on-page text, contact sections. Normalize obfuscated forms ("a [at] b [dot] edu" → "a@b.edu"). If no email is visible anywhere, set null — never guess.
+- role: their job title as written ("AP Physics Teacher", "Math Department Chair"). What they DO.
+- department: SUBJECT only — "Science", "Mathematics", "STEM", "Computer Science", "Engineering", "Technology". NEVER a school name. NEVER a grade level. Infer from role if the site doesn't name a department.
+- phone: extension if listed next to the teacher. Don't invent.
+- assignedSchool: ${siteType === "district" ? "REQUIRED (per district-mode rules above)" : "null"}
+
+━━ CRITICAL ANTI-PATTERNS ━━
+
+❌ Never put a school name in the department field
+❌ Never put a grade level in the department field
+❌ Never put a district name in assignedSchool
+❌ Never combine two real schools into one assignedSchool
+❌ Never fabricate an email
+
+━━ PLATFORM SHORTCUTS (save yourself iteration rounds) ━━
+
+If the directory page HTML contains \`class="fsConstituentItem"\`, it's a Finalsite directory (common for K-12 districts). Key facts:
+- the listing shows generic titles like "Teacher" without subjects — DO NOT rely on the listing view
+- use \`?const_search_keyword=<term>\` to reveal subject-specific titles (this searches both name AND title/profile fields)
+- sweep with ALL of these terms (do not skip any — each surfaces a different cohort): "math", "mathematics", "algebra", "geometry", "calculus", "statistics", "science", "biology", "chemistry", "physics", "environmental", "earth", "anatomy", "astronomy", "forensic", "computer", "computer science", "CS", "coding", "programming", "software", "tech ed", "technology", "IT", "digital", "stem", "engineering", "pre-engineering", "design technology", "maker", "robotics", "CAD", "drafting", "woodworking" — merge results by constituent ID. Missing ANY of these sweeps causes teachers to be silently dropped.
+- emails are JS-obfuscated: \`FS.util.insertEmail("elId", "<reversed domain>", "<reversed username>", true)\` — REVERSE BOTH to decode
+- paginate with \`?const_page=N\`; total count is in \`.fsPaginationLabel\`
+- do NOT paginate all pages if the directory has 500+ entries — targeted keyword searches are 10× faster than scanning 29 pages of generic titles
+
+━━ COVERAGE ━━
+
+- Handle pagination: click "Next"/"Load More"/page numbers to visit ALL pages.
+- If organized by school or department, visit EVERY relevant section.
+- Click into individual profiles when emails or titles aren't on the listing page.
+- When in doubt about STEM, include — we'll filter later.
+
+━━ OUTPUT ━━
+
+Return the data using structured output — an object with a "teachers" array where each entry matches the required fields above. Do NOT save to a file. Do NOT call save_output_json. Do NOT summarize in prose. Return the literal structured data.`;
 }
 
 // ── main export ──
 
+export interface ScraperOutput {
+  teachers: RawTeacherData[];
+  siteInfo: RawSiteInfo;
+  sessionId: string;
+}
+
+// browser-use model. gpt-5.4-mini is the cheapest tier ($0.90/1M in, $5.40/1M
+// out) and handles classify + navigation well. the extract task is where
+// recall matters most — missed teachers = silent data loss and per-run
+// variance — so we bump extraction to claude-sonnet-4.6 ($3.60/$18.00) for
+// stronger coverage on long keyword sweeps.
+const SCRAPER_MODEL_DEFAULT = "gpt-5.4-mini" as const;
+const SCRAPER_MODEL_EXTRACT = "claude-sonnet-4.6" as const;
+
+export interface ScrapeSchoolOptions {
+  onStatus?: (msg: string) => void;
+  onMilestone?: (msg: string, level?: "info" | "warn") => void;
+  onLiveUrl?: (url: string) => void;
+  /**
+   * fires at each sub-task boundary inside the scraper. lets the orchestrator
+   * advance its phase indicator deterministically without substring-matching
+   * browser-agent reasoning (which can spuriously contain phrases like
+   * "extracting STEM teachers" mid-task 2 and cause premature transitions).
+   */
+  onScraperPhase?: (phase: "classify" | "directory" | "extract") => void;
+}
+
 export async function scrapeSchool(
   schoolUrl: string,
-  onStatus?: (msg: string) => void,
-  onLiveUrl?: (url: string) => void,
-): Promise<{
-  teachers: RawTeacherData[];
-  schoolAddress: string | null;
-  schoolName: string | null;
-  sessionId: string;
-}> {
-  const status = onStatus ?? (() => {});
+  options: ScrapeSchoolOptions = {},
+): Promise<ScraperOutput> {
+  const status = options.onStatus ?? (() => {});
+  const milestone = options.onMilestone ?? (() => {});
+  const onLiveUrl = options.onLiveUrl;
 
   const client = createClient();
   const session = await createSession(client);
@@ -143,46 +343,175 @@ export async function scrapeSchool(
   if (liveUrl) onLiveUrl?.(liveUrl);
 
   try {
-    // task 1 — discover the staff directory
-    status("finding staff directory...");
-    const directoryOutput = await runTask(
+    // task 1 — classify the site (structured output)
+    options.onScraperPhase?.("classify");
+    status("classifying site (district vs single school)...");
+    const rawSite = await runTaskStructured(
       client,
       sessionId,
-      promptFindStaffDirectory(schoolUrl),
-      onStatus,
+      promptClassifySite(schoolUrl),
+      SiteInfoSchema,
+      { onMessage: options.onStatus, model: SCRAPER_MODEL_DEFAULT },
+    );
+    // defensive: strip umbrella labels from the schools list so the extractor
+    // doesn't treat them as valid per-teacher assignment targets. two sources
+    // of truth:
+    //   1. schoolGroups[].umbrella the model reported
+    //   2. auto-detection: schools ending in plural "Schools" when another
+    //      school shares their first word — real schools are singular "School";
+    //      plural almost always means umbrella (e.g. "Williston Schools" paired
+    //      with "Williston Central School")
+    const reportedUmbrellas = new Set(
+      (rawSite.schoolGroups ?? []).map((g) => g.umbrella.trim().toLowerCase()),
+    );
+    const allSchools = rawSite.schools ?? [];
+    const autoDetectedGroups: Array<{ umbrella: string; members: string[] }> = [];
+
+    for (const s of allSchools) {
+      const norm = s.trim().toLowerCase();
+      if (reportedUmbrellas.has(norm)) continue;
+      // must end in plural "Schools" (not "School")
+      if (!/\bschools\s*$/i.test(s.trim())) continue;
+
+      const firstWord = s.trim().split(/\s+/)[0]?.toLowerCase();
+      if (!firstWord || firstWord.length < 3) continue;
+
+      const members = allSchools.filter((other) => {
+        if (other === s) return false;
+        // other must start with the same first word AND be singular "School"
+        const otherFirst = other.trim().split(/\s+/)[0]?.toLowerCase();
+        return otherFirst === firstWord && /\bschool\b(?!s)/i.test(other);
+      });
+
+      if (members.length >= 1) {
+        autoDetectedGroups.push({ umbrella: s, members });
+        reportedUmbrellas.add(norm);
+      }
+    }
+
+    const dedupedSchools = allSchools.filter(
+      (s) => !reportedUmbrellas.has(s.trim().toLowerCase()),
     );
 
-    // task 2 — extract stem teachers from the directory
-    status("extracting STEM teachers...");
-    const teachersOutput = await runTask(
-      client,
-      sessionId,
-      promptExtractTeachers(),
-      onStatus,
-    );
+    // follow-up probe: any plural "X Schools" label still in dedupedSchools
+    // that isn't covered by reportedUmbrellas is a candidate umbrella we
+    // couldn't split via the sibling-first-word heuristic (because its members
+    // aren't in the top-level school list yet). ask the agent to drill in and
+    // enumerate members. cheap second pass, protects the "perfect data" goal.
+    const probedGroups: Array<{ umbrella: string; members: string[] }> = [];
+    let finalSchools = dedupedSchools;
 
-    // task 3 — grab school name and address
-    status("grabbing school address...");
-    const infoOutput = await runTask(
-      client,
-      sessionId,
-      promptGetSchoolInfo(),
-      onStatus,
-    );
+    if (rawSite.siteType === "district") {
+      const candidates = dedupedSchools.filter((s) =>
+        /\bschools\s*$/i.test(s.trim()),
+      );
+      for (const candidate of candidates) {
+        status(`checking if "${candidate}" is an umbrella for multiple schools...`);
+        try {
+          const probe = await runTaskStructured(
+            client,
+            sessionId,
+            promptUmbrellaMembers(candidate, rawSite.name),
+            UmbrellaMembersSchema,
+            { onMessage: options.onStatus, model: SCRAPER_MODEL_DEFAULT },
+          );
+          if (probe.isUmbrella && probe.members.length >= 2) {
+            probedGroups.push({ umbrella: candidate, members: probe.members });
+            milestone(
+              `split "${candidate}" into ${probe.members.length} member schools (${probe.members.join(", ")})`,
+            );
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          status(`umbrella probe for "${candidate}" failed: ${msg}`);
+        }
+      }
 
-    // parse the natural language outputs into structured data via ai
-    status("structuring extracted data...");
-    const [teachers, schoolInfo] = await Promise.all([
-      extractTeachers(teachersOutput),
-      extractSchoolInfo(infoOutput),
-    ]);
+      if (probedGroups.length > 0) {
+        const umbrellaNames = new Set(
+          probedGroups.map((g) => g.umbrella.trim().toLowerCase()),
+        );
+        const membersToAdd = probedGroups.flatMap((g) => g.members);
+        finalSchools = [
+          ...dedupedSchools.filter(
+            (s) => !umbrellaNames.has(s.trim().toLowerCase()),
+          ),
+          ...membersToAdd,
+        ];
+        // dedupe while preserving order
+        const seen = new Set<string>();
+        finalSchools = finalSchools.filter((s) => {
+          const k = s.trim().toLowerCase();
+          if (seen.has(k)) return false;
+          seen.add(k);
+          return true;
+        });
+      }
+    }
 
-    return {
-      teachers,
-      schoolAddress: schoolInfo.address,
-      schoolName: schoolInfo.name,
-      sessionId,
+    const siteInfo: RawSiteInfo = {
+      siteType: rawSite.siteType,
+      name: rawSite.name,
+      address: rawSite.address,
+      schools: finalSchools,
+      schoolGroups: [
+        ...(rawSite.schoolGroups ?? []),
+        ...autoDetectedGroups,
+        ...probedGroups,
+      ],
     };
+
+    // milestone fires RIGHT NOW, not after all 3 tasks finish. previously the
+    // orchestrator emitted this after scrapeSchool returned, so "detected
+    // district" only showed up alongside the final "extracted teachers" at
+    // the very end of phase 3. firing inline means the user sees it the
+    // moment classification completes.
+    if (siteInfo.siteType === "district") {
+      const n = siteInfo.schools?.length ?? 0;
+      milestone(
+        `detected district: ${siteInfo.name ?? "(unknown)"} (${n} school${n === 1 ? "" : "s"})`,
+      );
+    } else {
+      milestone(
+        `detected single school: ${siteInfo.name ?? "(unknown)"}`,
+      );
+    }
+
+    // task 2 — discover staff directory/directories (free-form text is fine here;
+    // used only as navigation context for the agent on its next task)
+    options.onScraperPhase?.("directory");
+    status("finding staff directory...");
+    await runTask(client, sessionId, promptFindStaffDirectory(siteInfo.siteType), {
+      onMessage: options.onStatus,
+      model: SCRAPER_MODEL_DEFAULT,
+    });
+
+    // task 3 — extract stem teachers (structured output)
+    options.onScraperPhase?.("extract");
+    status("extracting STEM teachers...");
+    const extraction = await runTaskStructured(
+      client,
+      sessionId,
+      promptExtractTeachers(siteInfo.siteType, siteInfo.schools ?? []),
+      TeachersSchema,
+      { onMessage: options.onStatus, model: SCRAPER_MODEL_EXTRACT },
+    );
+
+    // normalize to our RawTeacherData shape (strip nulls where our type expects undefined)
+    const teachers: RawTeacherData[] = extraction.teachers.map((t) => ({
+      name: t.name,
+      ...(t.email != null && { email: t.email }),
+      ...(t.role != null && { role: t.role }),
+      ...(t.department != null && { department: t.department }),
+      ...(t.phone != null && { phone: t.phone }),
+      ...(t.assignedSchool != null && { assignedSchool: t.assignedSchool }),
+    }));
+
+    milestone(
+      `extracted ${teachers.length} teacher candidate${teachers.length === 1 ? "" : "s"} from the site`,
+    );
+
+    return { teachers, siteInfo, sessionId };
   } finally {
     await stopSession(client, sessionId);
   }

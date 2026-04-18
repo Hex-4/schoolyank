@@ -42,6 +42,120 @@ export async function lookupSchool(
 }
 
 /**
+ * lists every school in a district by its NCES LEA id. walks paginated results
+ * until the api reports no more pages. the LEA roster is the authoritative list
+ * for per-teacher school resolution in district mode.
+ */
+export async function lookupSchoolsInDistrict(
+  leaid: string,
+): Promise<NCESSchoolRecord[]> {
+  const records: NCESSchoolRecord[] = [];
+  let page = 1;
+
+  while (true) {
+    const params = new URLSearchParams({ leaid, page: String(page) });
+    const url = `${API_BASE}/?${params}`;
+
+    try {
+      const res = await fetch(url);
+      if (!res.ok) {
+        console.error(`[nces] api returned ${res.status} for ${url}`);
+        break;
+      }
+
+      const data = (await res.json()) as {
+        results: NCESSchoolRecord[];
+        next?: string | null;
+      };
+
+      if (!data.results?.length) break;
+      records.push(...data.results);
+
+      if (!data.next) break;
+      page++;
+    } catch (err) {
+      console.error(`[nces] failed to fetch district schools:`, err);
+      break;
+    }
+  }
+
+  return records;
+}
+
+/**
+ * given a list of schools in a district and a scraped school name, return the
+ * nces record that best matches. uses word-overlap + levenshtein on normalized
+ * names. returns null if no candidate is reasonably close.
+ */
+export function matchSchoolInDistrict(
+  scrapedName: string,
+  schools: NCESSchoolRecord[],
+): NCESSchoolRecord | null {
+  if (!scrapedName.trim() || schools.length === 0) return null;
+
+  // extract any uppercase initialism from the scraped name (e.g. "CVU" from
+  // "CVU High School"). we'll boost roster candidates whose first-letter
+  // acronym matches this — catches cases like "CVU High School" vs
+  // "Champlain Valley Union High School" that pure word-overlap misses.
+  const initialism = extractInitialism(scrapedName);
+
+  // tokenize the scraped name (excluding generic fillers) for word overlap
+  const qWords = tokenize(scrapedName);
+
+  let best: NCESSchoolRecord | null = null;
+  let bestScore = -Infinity;
+
+  for (const s of schools) {
+    const nWords = tokenize(s.school_name);
+    const overlap = setOverlap(qWords, nWords);
+
+    const dist = levenshtein(
+      normalize(scrapedName),
+      normalize(s.school_name),
+    );
+    const maxLen = Math.max(scrapedName.length, s.school_name.length, 1);
+    const lev = 1 - dist / maxLen;
+
+    // initialism boost: if the scraped name has an all-caps word like "CVU"
+    // and the candidate's first-letters-of-words match it, give a big bump.
+    const initialsMatch =
+      initialism && acronymOf(s.school_name).includes(initialism);
+    const boost = initialsMatch ? 0.4 : 0;
+
+    const score = overlap * 0.6 + lev * 0.2 + boost;
+    if (score > bestScore) {
+      bestScore = score;
+      best = s;
+    }
+  }
+
+  return bestScore >= 0.35 ? best : null;
+}
+
+/** pull out any all-caps word of 2-5 letters — typical school acronym shape */
+function extractInitialism(s: string): string | null {
+  const match = s.match(/\b([A-Z]{2,5})\b/);
+  return match ? match[1]!.toLowerCase() : null;
+}
+
+/** build a first-letter acronym from a multi-word name */
+function acronymOf(s: string): string {
+  return (s.match(/\b[a-zA-Z]/g) ?? []).join("").toLowerCase();
+}
+
+// words we ignore when comparing names — they carry no discriminating info
+const GENERIC_TOKENS = new Set([
+  "school", "schools", "the", "of", "and", "at",
+  "academy", "institute", "center", "centre",
+]);
+
+/** tokenize a school name into content words, dropping generic fillers */
+function tokenize(name: string): Set<string> {
+  const words = normalize(name).match(/[a-z0-9]+/g) ?? [];
+  return new Set(words.filter((w) => !GENERIC_TOKENS.has(w) && w.length > 1));
+}
+
+/**
  * converts an NCES record into our Address type.
  * prefers mailing address; falls back to location address when mailing
  * fields are "-1" (the api's sentinel for missing data).
@@ -130,6 +244,16 @@ function bestMatch(query: string, records: NCESSchoolRecord[]): NCESSchoolRecord
 /** lowercases and strips non-alphanumeric chars for comparison */
 function normalize(s: string): string {
   return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** jaccard overlap between two string sets */
+function setOverlap(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 && b.size === 0) return 1;
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const w of a) if (b.has(w)) inter++;
+  const union = new Set([...a, ...b]).size;
+  return inter / union;
 }
 
 /** classic levenshtein distance — no external deps needed */

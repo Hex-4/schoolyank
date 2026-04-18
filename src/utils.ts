@@ -4,9 +4,30 @@ const PREFIXES = /^(mr\.|mrs\.|ms\.|dr\.|prof\.)\s+/i;
 const SUFFIXES = /,?\s+(jr\.|sr\.|iii|iv|ph\.d\.|m\.ed\.|ed\.d\.)$/i;
 
 function titleCase(s: string): string {
-  return s
+  if (!s) return s;
+
+  // short all-caps tokens (≤3 chars) are almost always acronym initials —
+  // "JP", "JD", "DJ", "TJ", "AJ" etc. — and should be preserved as-is.
+  // without this special case the all-caps branch below lowercases them
+  // into "Jp", "Jd" etc.
+  if (/^[A-Z]{2,3}$/.test(s)) return s;
+
+  // if the input already looks mixed-case (has both upper and lower letters
+  // AND isn't ALL CAPS), trust it — preserves "MacFadyen", "O'Brien",
+  // "de la Cruz", "St. Martin" as written on the site.
+  const hasLower = /[a-z]/.test(s);
+  const hasUpper = /[A-Z]/.test(s);
+  if (hasLower && hasUpper) return s;
+
+  // otherwise titlecase and re-capitalize after common name prefixes that
+  // naive capitalize-after-whitespace misses: "Mc", "Mac" (when followed by
+  // a capital-looking stem), "O'", "D'", "St.".
+  const cased = s
     .toLowerCase()
-    .replace(/(?:^|\s|-)(\w)/g, (_, c) => _.slice(0, -1) + c.toUpperCase());
+    .replace(/(?:^|\s|-)(\w)/g, (match, c: string) => match.slice(0, -1) + c.toUpperCase());
+  return cased
+    .replace(/\b(Mc|Mac)([a-z])/g, (_, prefix: string, c: string) => `${prefix}${c.toUpperCase()}`)
+    .replace(/\b([OD])'([a-z])/g, (_, prefix: string, c: string) => `${prefix}'${c.toUpperCase()}`);
 }
 
 export function parseName(fullName: string): { firstName: string; lastName: string } {

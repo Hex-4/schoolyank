@@ -5,6 +5,7 @@ import type {
   Teacher,
   ConfidenceScore,
   DataSource,
+  HackerScore,
 } from "./types";
 import { parseName, normalizeEmail } from "./utils";
 
@@ -39,6 +40,17 @@ const FALSE_POSITIVE_PATTERNS = [
   /\baftermath\b/i,
 ];
 
+// tokens that indicate a value is a school/building name rather than a subject
+const SCHOOL_NAME_MARKERS = [
+  /\bschool\b/i,
+  /\bacademy\b/i,
+  /\belementary\b/i,
+  /\bmiddle\b/i,
+  /\bhigh\s+school\b/i,
+  /\binstitute\b/i,
+  /\bcampus\b/i,
+];
+
 // ── public api ──
 
 /**
@@ -66,8 +78,20 @@ export function isStemRole(role: string, department?: string | null): boolean {
   return hasStemKeyword(combined);
 }
 
+/**
+ * returns true if the given value looks like a school/building name rather
+ * than a subject department. used to scrub values that the scraper misfiled
+ * into the department column on district sites.
+ */
+export function looksLikeSchoolName(value: string): boolean {
+  if (!value) return false;
+  for (const pattern of SCHOOL_NAME_MARKERS) {
+    if (pattern.test(value)) return true;
+  }
+  return false;
+}
+
 function hasStemKeyword(text: string): boolean {
-  // sort by length descending so multi-word keywords match before sub-words
   for (const kw of STEM_KEYWORDS) {
     const pattern = new RegExp(`\\b${escapeRegex(kw)}\\b`, "i");
     if (pattern.test(text)) return true;
@@ -152,23 +176,77 @@ export function inferEmails(teachers: Teacher[]): Teacher[] {
 }
 
 /**
+ * infer the canonical email domain from the MAJORITY of teacher emails. the
+ * URL-derived domain is unreliable — users can type typo aliases (e.g.
+ * `cvs-dvt.org` vs the real `cvsdvt.org`), redirect aliases, or the site may
+ * use a different domain than its emails (e.g. `schoolwebsite.com` but emails
+ * at `@district.edu`). majority-of-emails is the ground-truth domain for
+ * confidence scoring.
+ */
+function inferCanonicalEmailDomain(
+  teachers: { email: string | null }[],
+  fallback: string,
+): string {
+  const counts = new Map<string, number>();
+  for (const t of teachers) {
+    const d = t.email?.split("@")[1]?.trim().toLowerCase();
+    if (!d) continue;
+    counts.set(d, (counts.get(d) ?? 0) + 1);
+  }
+  if (counts.size === 0) return fallback;
+
+  let topDomain = fallback;
+  let topCount = 0;
+  for (const [d, c] of counts) {
+    if (c > topCount) {
+      topDomain = d;
+      topCount = c;
+    }
+  }
+  return topDomain;
+}
+
+export interface ValidateOptions {
+  /**
+   * when false, skip the keyword-based STEM filter so the orchestrator can
+   * do its own LLM-powered filter pass. name parsing, email inference,
+   * dedup, and confidence scoring still run. default true (backwards-compat).
+   */
+  stemFilter?: boolean;
+}
+
+/**
  * main validation pipeline — transforms raw extracted data into clean Teacher records.
  */
-export function validateTeachers(raw: RawTeacherData[], schoolDomain: string): Teacher[] {
-  const domain = schoolDomain.toLowerCase().replace(/^www\./, "");
+export function validateTeachers(
+  raw: RawTeacherData[],
+  schoolDomain: string,
+  options: ValidateOptions = {},
+): Teacher[] {
+  const urlDomain = schoolDomain.toLowerCase().replace(/^www\./, "");
+  const applyStemFilter = options.stemFilter ?? true;
 
-  // step a + b: parse names and normalize emails
+  // step a + b: parse names, normalize emails, scrub column confusion
   let teachers: Teacher[] = raw
     .filter((r) => r.name?.trim())
     .map((r) => {
       const { firstName, lastName } = parseName(r.name);
       const email = r.email ? normalizeEmail(r.email) : null;
 
-      // step c: flag domain mismatches (keep the email, but note it)
-      let emailDomainMatch = false;
-      if (email) {
-        const emailDomain = email.split("@")[1];
-        emailDomainMatch = emailDomain === domain;
+      // email-domain match is computed against the canonical domain below,
+      // after we know the majority email domain. placeholder here.
+      const emailDomainMatch = false;
+
+      // scrub school names that leaked into the department column — the scraper
+      // on district sites historically stuffed school names here because there
+      // was no assignedSchool field. if department looks like a school name,
+      // move it to assignedSchool (only if that's empty) and null out department.
+      let department: string | null = r.department?.trim() || null;
+      let assignedSchool: string | null = r.assignedSchool?.trim() || null;
+
+      if (department && looksLikeSchoolName(department)) {
+        if (!assignedSchool) assignedSchool = department;
+        department = null;
       }
 
       return {
@@ -176,11 +254,14 @@ export function validateTeachers(raw: RawTeacherData[], schoolDomain: string): T
         lastName,
         email,
         role: r.role?.trim() ?? "",
-        department: r.department?.trim() || null,
+        department,
+        schoolName: assignedSchool,
+        schoolNcesId: null,
         phoneExtension: r.phone?.trim() || null,
         linkedinUrl: null,
         sources: ["school_website"] as DataSource[],
         confidence: 1 as ConfidenceScore,
+        hackerScore: computeHackerScore(r.role ?? "", department),
         _emailDomainMatch: emailDomainMatch,
       };
     });
@@ -188,10 +269,12 @@ export function validateTeachers(raw: RawTeacherData[], schoolDomain: string): T
   // step d: infer missing emails from detected patterns
   teachers = inferEmails(teachers);
 
-  // step e: filter out non-STEM teachers
+  // step e: filter out non-STEM teachers (role OR department must indicate stem).
+  // when stemFilter=false the orchestrator runs an LLM pass instead; we still
+  // drop records with no role AND no department since they're uncheckable.
   teachers = teachers.filter((t) => {
     if (!t.role && !t.department) return false;
-    return isStemRole(t.role, t.department);
+    return applyStemFilter ? isStemRole(t.role, t.department) : true;
   });
 
   // step f: deduplicate by first + last name
@@ -205,10 +288,15 @@ export function validateTeachers(raw: RawTeacherData[], schoolDomain: string): T
   }
   teachers = [...seen.values()];
 
+  // derive the canonical email domain from the MAJORITY of teacher emails —
+  // NOT from the scraped URL. URLs can be typo aliases (`cvs-dvt.org`) while
+  // actual emails use the real domain (`@cvsdvt.org`). emails are ground truth.
+  const canonicalDomain = inferCanonicalEmailDomain(teachers, urlDomain);
+
   // step g: assign confidence scores
   teachers = teachers.map((t) => {
     const emailDomain = t.email?.split("@")[1];
-    const domainMatches = emailDomain === domain;
+    const domainMatches = emailDomain === canonicalDomain;
     const hasEmail = !!t.email;
     const isInferred = t.sources.includes("inferred");
     const stemRole = isStemRole(t.role, t.department);
@@ -232,8 +320,6 @@ export function validateTeachers(raw: RawTeacherData[], schoolDomain: string): T
     return { ...clean, confidence };
   });
 
-  // step h: sources already set to ["school_website"] (+ "inferred" where applicable)
-
   // sort by confidence desc, then last name asc
   teachers.sort((a, b) => {
     if (b.confidence !== a.confidence) return b.confidence - a.confidence;
@@ -251,8 +337,113 @@ function scoreTeacher(t: Teacher): number {
   if (t.email) s += 3;
   if (t.role) s += 2;
   if (t.department) s += 1;
+  if (t.schoolName) s += 1;
   if (t.phoneExtension) s += 1;
   return s;
+}
+
+// ── hacker score ────────────────────────────────────────────────────────────
+// affinity for Hack Club's project-based CS / maker / hacker ethos. scored 1-5
+// off the teacher's role + department keywords. tiers are ordered from highest
+// to lowest so an ambiguous teacher ("Physics & CS Teacher") gets the top tier
+// that matches.
+
+const HACKER_TIERS: { score: HackerScore; patterns: RegExp[] }[] = [
+  // tier 5: dedicated hacker-adjacent teaching — CS, software, security, hackathons
+  {
+    score: 5,
+    patterns: [
+      /\bcomputer\s+science\b/i,
+      /\bcomp\s*sci\b/i,
+      /\bAP\s+CS\b/i,
+      /\bcoding\b/i,
+      /\bprogramming\b/i,
+      /\bsoftware\b/i,
+      /\bweb\s+(design|development|dev)\b/i,
+      /\bapp\s+development\b/i,
+      /\bgame\s+(design|development|dev)\b/i,
+      /\bcyber\s*security\b/i,
+      /\bdata\s+science\b/i,
+      /\bmachine\s+learning\b/i,
+      /\bhackathon\b/i,
+      /\bhack\s*club\b/i,
+      /\bCS\b/, // case-sensitive on purpose: "CS" acronym, not "cs" in "classroom"
+    ],
+  },
+  // tier 4: engineering, robotics, maker, digital/tech — build-things domains
+  {
+    score: 4,
+    patterns: [
+      /\bengineering\b/i,
+      /\brobotics\b/i,
+      /\bmaker\s*(space|lab)?\b/i,
+      /\b3d\s+printing\b/i,
+      /\belectronics\b/i,
+      /\bdigital\s+(electronics|design|fabrication|learning|media|technology)\b/i,
+      /\bdesign\s+technology\b/i,
+      /\btech(?:nology)?\s+(integration|integrator|coordinator|ed(?:ucation)?)\b/i,
+      /\binformation\s+technology\b/i,
+      /\bIT\s+(teacher|instructor|coordinator)\b/,
+      /\bSTEM\b/,
+      /\bpre-?engineering\b/i,
+      /\bprinciples\s+of\s+engineering\b/i,
+      /\bproject\s+lead\s+the\s+way\b/i,
+      /\bPLTW\b/,
+    ],
+  },
+  // tier 3: tinker-adjacent — physics, applied science, CAD
+  {
+    score: 3,
+    patterns: [
+      /\bphysics\b/i,
+      /\bCAD\b/,
+      /\bdrafting\b/i,
+      /\bwoodworking\b/i,
+      /\bshop\b/i,
+      /\bapplied\s+science\b/i,
+      /\bforensic\s+science\b/i,
+      /\bastronomy\b/i,
+    ],
+  },
+  // tier 2: life + earth sciences — STEM but lab-coat, not hacker
+  {
+    score: 2,
+    patterns: [
+      /\bchemistry\b/i,
+      /\bbiology\b/i,
+      /\bbio\b/i,
+      /\benvironmental\s+science\b/i,
+      /\bearth\s+science\b/i,
+      /\banatomy\b/i,
+      /\bphysiology\b/i,
+      /\bgeology\b/i,
+      /\bmarine\s+biology\b/i,
+      /\blife\s+science\b/i,
+      /\bphysical\s+science\b/i,
+      /\bgeneral\s+science\b/i,
+      /\bscience\b/i,
+    ],
+  },
+];
+
+/**
+ * compute a 1-5 Hack Club affinity score from a teacher's role + department.
+ * CS/coding/software = 5, engineering/robotics/maker = 4, physics/applied = 3,
+ * chem/bio/env = 2, math and everything else = 1.
+ */
+export function computeHackerScore(
+  role: string,
+  department: string | null | undefined,
+): HackerScore {
+  const text = [role, department].filter(Boolean).join(" ");
+  if (!text.trim()) return 1;
+
+  for (const tier of HACKER_TIERS) {
+    if (tier.patterns.some((p) => p.test(text))) return tier.score;
+  }
+  // default tier 1: math and anything else that passed the STEM filter but
+  // doesn't match a more hacker-flavored keyword.
+  return 1;
 }
 
 /** roles that mention stem-adjacent terms but aren't clearly a stem teaching role */

@@ -1,97 +1,338 @@
 // ── orchestrator: coordinates the 4-phase scraping pipeline ──
 
-import type { ScrapeConfig, ScrapeResult, SchoolInfo, Address } from "./types";
+import type {
+  ScrapeConfig,
+  ScrapeResult,
+  SchoolInfo,
+  DistrictInfo,
+  Address,
+  Teacher,
+  NCESSchoolRecord,
+  RawSiteInfo,
+} from "./types";
 import { scrapeSchool } from "./scraper";
-import { lookupSchool, ncesRecordToAddress, extractSchoolNameFromUrl } from "./nces";
-import { validateTeachers, inferEmails } from "./validator";
+import {
+  lookupSchool,
+  lookupSchoolsInDistrict,
+  matchSchoolInDistrict,
+  ncesRecordToAddress,
+  extractSchoolNameFromUrl,
+} from "./nces";
+import { validateTeachers, computeHackerScore, isStemRole } from "./validator";
+import { judgeStemAndHacker } from "./judge";
+import { validateEmailsBatched } from "./emailValidator";
 import { enrichWithLinkedin } from "./linkedin";
 import { generateCsv, writeCsv } from "./csv";
 import { extractDomain } from "./utils";
 
+// ── progress phase model ─────────────────────────────────────────────────────
+// each phase renders as "[i/N] label" in the spinner. only phases that actually
+// run are counted — linkedin is skipped in the total when disabled.
+export type PhaseId =
+  | "classify"
+  | "directory"
+  | "extract"
+  | "nces"
+  | "linkedin"
+  | "export";
+
+export const PHASE_LABELS: Record<PhaseId, string> = {
+  classify: "classifying site",
+  directory: "finding staff directory",
+  extract: "extracting teachers",
+  nces: "verifying with NCES",
+  linkedin: "enriching via LinkedIn",
+  export: "writing CSV",
+};
+
+export interface RunOptions {
+  /** transient status updates — shown in the spinner */
+  onStatus?: (msg: string) => void;
+  /** phase transitions — lets the UI update its phase indicator */
+  onPhase?: (phase: PhaseId, index: number, total: number) => void;
+  /** persistent milestone messages — shown above the spinner and preserved */
+  onMilestone?: (msg: string, level?: "info" | "warn") => void;
+  /** live-url for watching the browser session */
+  onLiveUrl?: (url: string) => void;
+}
+
 /**
  * runs the full pipeline: scrape → nces verify → linkedin enrich → csv export.
- * the onStatus callback receives human-readable progress messages.
  */
 export async function run(
   config: ScrapeConfig,
-  onStatus?: (msg: string) => void,
-  onLiveUrl?: (url: string) => void,
+  options: RunOptions = {},
 ): Promise<ScrapeResult> {
-  const log = onStatus ?? (() => {});
+  const log = options.onStatus ?? (() => {});
+  const milestone = options.onMilestone ?? (() => {});
+  const onLiveUrl = options.onLiveUrl;
+  const onPhase = options.onPhase ?? (() => {});
+
   const startTime = Date.now();
   const warnings: string[] = [];
 
-  // ── phase 1: scrape the school website ──
-  log("phase 1: crawling school website...");
-  const scrapeResult = await scrapeSchool(config.schoolUrl, onStatus, onLiveUrl);
+  // the classify + directory + extract tasks all run inside scrapeSchool. we
+  // still model them as distinct phases so the ui shows meaningful progress
+  // while the scraper thinks. linkedin is optional and affects total count.
+  const totalPhases = config.enableLinkedin ? 6 : 5;
+  const phaseIndex: Record<PhaseId, number> = {
+    classify: 1,
+    directory: 2,
+    extract: 3,
+    nces: 4,
+    linkedin: 5,
+    export: config.enableLinkedin ? 6 : 5,
+  };
+
+  function enterPhase(phase: PhaseId) {
+    onPhase(phase, phaseIndex[phase], totalPhases);
+  }
+
+  // ── scraping (phases 1-3: classify, directory, extract) ──
+  // the scraper drives these subphases itself and calls onScraperPhase at each
+  // boundary. we listen for that callback to advance our phase indicator —
+  // substring-matching agent messages was unreliable (agent reasoning could
+  // mention "extracting STEM teachers" mid-task-2, causing premature jumps).
+  enterPhase("classify");
+
+  const scrapeResult = await scrapeSchool(config.schoolUrl, {
+    onStatus: log,
+    onMilestone: milestone,
+    onLiveUrl,
+    onScraperPhase: (phase) => {
+      if (phase === "classify") enterPhase("classify");
+      else if (phase === "directory") enterPhase("directory");
+      else if (phase === "extract") enterPhase("extract");
+    },
+  });
 
   const schoolDomain = extractDomain(config.schoolUrl);
-  const rawTeacherCount = scrapeResult.teachers.length;
-  log(`found ${rawTeacherCount} potential STEM teachers on the site`);
 
-  // ── phase 2: verify school info with nces ──
-  log("phase 2: verifying with NCES...");
-  const schoolInfo = await resolveSchoolInfo(
-    scrapeResult.schoolName,
-    scrapeResult.schoolAddress,
+  // ── validate + clean teachers ──
+  const preValidateCount = scrapeResult.teachers.length;
+  const preWithEmail = scrapeResult.teachers.filter((r) => r.email).length;
+
+  // two-stage filter: validator handles name parsing, email inference, dedup,
+  // and confidence scoring — but defers STEM classification + hacker score to
+  // an LLM batch pass (one call for the whole district). keyword fallback
+  // runs if the LLM errors or returns a malformed response, so the pipeline
+  // never blocks on this.
+  const candidates = validateTeachers(scrapeResult.teachers, schoolDomain, {
+    stemFilter: false,
+  });
+
+  let teachers: Teacher[];
+  log("classifying teachers (STEM + hacker score)...");
+  const judgments = await judgeStemAndHacker(
+    candidates.map((t) => ({
+      firstName: t.firstName,
+      lastName: t.lastName,
+      role: t.role,
+      department: t.department,
+    })),
+  );
+
+  if (judgments && judgments.length === candidates.length) {
+    const byIdx = new Map(judgments.map((j) => [j.index, j]));
+    teachers = [];
+    for (let i = 0; i < candidates.length; i++) {
+      const j = byIdx.get(i);
+      if (!j || !j.isStem) continue;
+      const t = candidates[i]!;
+      t.hackerScore = j.hackerScore;
+      teachers.push(t);
+    }
+    milestone(
+      `kept ${teachers.length} STEM teachers via LLM judge (filtered ${preValidateCount - teachers.length} non-STEM / support staff)`,
+    );
+  } else {
+    // fallback: keyword STEM filter + keyword hacker scorer. re-run validator
+    // with the filter enabled so we get the same pipeline output shape.
+    teachers = validateTeachers(scrapeResult.teachers, schoolDomain, {
+      stemFilter: true,
+    });
+    milestone(
+      `kept ${teachers.length} STEM teachers via keyword fallback (LLM judge unavailable)`,
+      "warn",
+    );
+  }
+
+  // ── email validation (DNS MX + SMTP RCPT TO, no API keys) ──
+  // null out emails that the destination server explicitly rejects (550/551
+  // /553 at RCPT TO) or whose domain has no MX record. inconclusive emails
+  // (timeouts, catch-all servers, transient errors) stay untouched — we
+  // don't trash data on a flaky probe.
+  const emailsToCheck = teachers
+    .filter((t) => t.email)
+    .map((t) => t.email!);
+  if (emailsToCheck.length > 0) {
+    log(`validating ${emailsToCheck.length} emails via DNS + SMTP...`);
+    const emailStatuses = await validateEmailsBatched(emailsToCheck);
+    let invalid = 0;
+    let noMx = 0;
+    let valid = 0;
+    let inconclusive = 0;
+    for (const t of teachers) {
+      if (!t.email) continue;
+      const status = emailStatuses.get(t.email) ?? "inconclusive";
+      if (status === "invalid") {
+        invalid++;
+        t.email = null;
+      } else if (status === "no_mx") {
+        noMx++;
+        t.email = null;
+      } else if (status === "valid") {
+        valid++;
+      } else {
+        inconclusive++;
+      }
+    }
+    const removed = invalid + noMx;
+    const total = valid + inconclusive + invalid + noMx;
+    if (removed > 0) {
+      milestone(
+        `email check: ${valid} valid, ${inconclusive} inconclusive, ${removed} removed (${invalid} bounced + ${noMx} no MX)`,
+        "warn",
+      );
+    } else if (valid > 0) {
+      milestone(
+        `email check: ${valid}/${total} verified, ${inconclusive} inconclusive`,
+      );
+    } else if (inconclusive === total && total > 0) {
+      // every probe came back inconclusive — almost certainly port 25 is
+      // blocked on this network. SMTP validation is effectively disabled;
+      // surface that to the user so they don't wonder why nothing changed.
+      milestone(
+        `email check: SMTP probe inconclusive for all ${total} emails (port 25 likely blocked — DNS MX still verified)`,
+        "warn",
+      );
+    } else {
+      milestone(
+        `email check: ${valid} valid, ${inconclusive} inconclusive, ${removed} removed`,
+      );
+    }
+  }
+
+  const inferredCount = teachers.filter((t) =>
+    t.sources.includes("inferred"),
+  ).length;
+  const missingEmailCount = teachers.filter((t) => !t.email).length;
+
+  if (inferredCount > 0) {
+    milestone(
+      `inferred ${inferredCount} missing email${inferredCount === 1 ? "" : "s"} from the district's pattern`,
+    );
+  }
+  if (missingEmailCount > 0) {
+    milestone(
+      `${missingEmailCount} teacher${missingEmailCount === 1 ? "" : "s"} still missing email — couldn't infer from the directory`,
+      "warn",
+    );
+  }
+
+  if (teachers.length === 0) {
+    warnings.push(
+      "no STEM teachers found — the school site may not have a staff directory, or the directory may not list subjects/departments",
+    );
+  }
+
+  // ── phase 4: nces ──
+  enterPhase("nces");
+  log("verifying school addresses with NCES...");
+  const { district, schools } = await resolveSites(
+    scrapeResult.siteInfo,
     config.schoolUrl,
+    teachers,
     log,
     warnings,
   );
 
-  // ── validate and clean teacher data ──
-  log("validating and cleaning teacher data...");
-  let teachers = validateTeachers(scrapeResult.teachers, schoolDomain);
-  log(`filtered to ${teachers.length} verified STEM teachers`);
+  // stamp each teacher with their resolved school (ncesId) when we can match them
+  resolveTeacherSchools(teachers, schools, district, warnings);
 
-  if (teachers.length === 0) {
-    warnings.push("no STEM teachers found — the school site may not have a staff directory, or the directory may not list subjects/departments");
+  // add nces to sources for any teacher who ended up with an nces-backed school
+  let ncesResolvedCount = 0;
+  for (const t of teachers) {
+    const resolved = findSchoolForTeacher(t, schools);
+    if (resolved?.address?.source === "nces") {
+      ncesResolvedCount++;
+      if (!t.sources.includes("nces")) t.sources.push("nces");
+    }
   }
 
-  // ── phase 3: linkedin enrichment (optional) ──
-  if (config.enableLinkedin && config.linkedinProfileId && teachers.length > 0) {
-    log("phase 3: enriching with LinkedIn...");
-    teachers = await enrichWithLinkedin(
-      teachers,
-      schoolInfo.name,
-      config.linkedinProfileId,
-      onStatus,
+  if (district) {
+    milestone(
+      `NCES: matched ${schools.filter((s) => s.ncesId && s.address?.source === "nces").length}/${schools.length} schools to federal records`,
     );
+  } else if (schools[0]?.address?.source === "nces") {
+    milestone(`NCES: verified school address`);
+  }
+  if (ncesResolvedCount < teachers.length && teachers.length > 0) {
+    const unresolved = teachers.length - ncesResolvedCount;
+    milestone(
+      `${unresolved} teacher${unresolved === 1 ? "" : "s"} fell back to district-office address (no NCES match for their school)`,
+      "warn",
+    );
+  }
 
-    // add "nces" to sources for teachers whose address came from nces
-    if (schoolInfo.address?.source === "nces") {
-      for (const t of teachers) {
-        if (!t.sources.includes("nces")) t.sources.push("nces");
-      }
-    }
-  } else {
-    log("phase 3: linkedin enrichment skipped");
+  // ── phase 5: linkedin enrichment (optional) ──
+  if (config.enableLinkedin && teachers.length > 0) {
+    enterPhase("linkedin");
+    log("searching LinkedIn profiles via Exa...");
+    const linkedinFallbackContext = district?.name ?? schools[0]?.name ?? "";
+    const enrichment = await enrichWithLinkedin(
+      teachers,
+      linkedinFallbackContext,
+      log,
+    );
+    teachers = enrichment.teachers;
 
-    if (schoolInfo.address?.source === "nces") {
-      for (const t of teachers) {
-        if (!t.sources.includes("nces")) t.sources.push("nces");
-      }
+    // linkedin enrichment rewrites role with the profile title (e.g. generic
+    // "Teacher" → "Computer Science Teacher at CVU"). re-score hacker affinity
+    // so tier promotions stick — a teacher labeled "Teacher" on the site but
+    // "AP Computer Science Teacher" on linkedin should jump from tier 1 → 5.
+    for (const t of teachers) {
+      t.hackerScore = computeHackerScore(t.role, t.department);
     }
+
+    const s = enrichment.stats;
+    milestone(
+      `LinkedIn: matched ${s.matched}/${s.processed} profiles (${s.noMatch} not found${s.failed > 0 ? `, ${s.failed} failed` : ""})`,
+    );
+    if (s.noMatch > 0) {
+      milestone(
+        `could not find LinkedIn profiles for ${s.noMatch} teacher${s.noMatch === 1 ? "" : "s"}`,
+        "warn",
+      );
+    }
+    if (s.failed > 0 && s.firstFailure) {
+      warnings.push(
+        `linkedin: ${s.failed} lookup${s.failed === 1 ? "" : "s"} failed (first: ${s.firstFailure})`,
+      );
+    }
+  } else if (config.enableLinkedin) {
+    milestone("LinkedIn enrichment skipped (no teachers to enrich)");
   }
 
   // ── assemble the final result ──
   const result: ScrapeResult = {
-    school: schoolInfo,
+    district,
+    schools,
     teachers,
     metadata: {
       scrapedAt: new Date().toISOString(),
       durationMs: Date.now() - startTime,
-      pagesVisited: 0, // browser-use doesn't expose this directly
+      pagesVisited: 0,
       browserUseSessionId: scrapeResult.sessionId,
       warnings,
     },
   };
 
-  // ── phase 4: export csv ──
-  log("phase 4: exporting CSV...");
+  // ── phase 6: export csv ──
+  enterPhase("export");
+  log("writing CSV...");
   const csv = generateCsv(result);
   await writeCsv(config.outputPath, csv);
-  log(`wrote ${teachers.length} teachers to ${config.outputPath}`);
 
   return result;
 }
@@ -99,55 +340,384 @@ export async function run(
 // ── helpers ──
 
 /**
- * resolves the most accurate school info by combining data
- * from the website scrape and the NCES database.
+ * resolves the district (if any) and the full list of schools relevant to this
+ * scrape. in district mode we pull the entire LEA roster from nces so each
+ * teacher's assigned school can be matched to a real nces record; in
+ * single-school mode we just look up the one school.
  */
-async function resolveSchoolInfo(
-  scrapedName: string | null,
-  scrapedAddress: string | null,
+async function resolveSites(
+  siteInfo: RawSiteInfo,
   schoolUrl: string,
+  teachers: Teacher[],
   log: (msg: string) => void,
   warnings: string[],
-): Promise<SchoolInfo> {
-  // determine the school name to search nces with
+): Promise<{ district: DistrictInfo | null; schools: SchoolInfo[] }> {
+  const state = extractState(siteInfo.address, schoolUrl);
+
+  if (siteInfo.siteType === "district") {
+    return resolveDistrict(siteInfo, schoolUrl, state, teachers, log, warnings);
+  }
+
+  return resolveSingleSchool(siteInfo, schoolUrl, state, log, warnings);
+}
+
+/**
+ * single-school mode: look up the one school in nces, wrap it as SchoolInfo.
+ * no district info is produced even when nces reports an lea_name — the distinction
+ * here is about the SITE being a district site vs a single school site.
+ */
+async function resolveSingleSchool(
+  siteInfo: RawSiteInfo,
+  schoolUrl: string,
+  state: string | null,
+  log: (msg: string) => void,
+  warnings: string[],
+): Promise<{ district: DistrictInfo | null; schools: SchoolInfo[] }> {
   const nameForSearch =
-    scrapedName ?? extractSchoolNameFromUrl(schoolUrl) ?? "";
+    siteInfo.name ?? extractSchoolNameFromUrl(schoolUrl) ?? "";
 
-  let ncesAddress: Address | null = null;
-  let ncesDistrict: string | null = null;
-  let ncesPhone: string | null = null;
-  let ncesId: string | null = null;
-  let officialName = scrapedName ?? "";
-
+  let record: NCESSchoolRecord | null = null;
   if (nameForSearch) {
-    // try to extract state from the scraped address or url
-    const state = extractState(scrapedAddress, schoolUrl);
-    const record = await lookupSchool(nameForSearch, state ?? undefined);
-
+    record = await lookupSchool(nameForSearch, state ?? undefined);
     if (record) {
       log(`matched NCES record: ${record.school_name} (${record.ncessch})`);
-      ncesAddress = ncesRecordToAddress(record);
-      ncesDistrict = record.lea_name !== "-1" ? record.lea_name : null;
-      ncesPhone = record.phone !== "-1" ? record.phone : null;
-      ncesId = record.ncessch;
-      officialName = record.school_name; // prefer the federal name
     } else {
       log("no NCES match found — using school website data");
       warnings.push("school not found in NCES database — address from school website only");
     }
   }
 
-  // fall back to the scraped address if nces didn't match
-  const address: Address | null = ncesAddress ?? parseAddress(scrapedAddress);
+  const address: Address | null = record
+    ? ncesRecordToAddress(record)
+    : parseAddress(siteInfo.address);
 
-  return {
-    name: officialName || "Unknown School",
+  const school: SchoolInfo = {
+    name: record?.school_name ?? siteInfo.name ?? "Unknown School",
     url: schoolUrl,
     address,
-    phone: ncesPhone,
-    district: ncesDistrict,
-    ncesId,
+    phone: record && record.phone !== "-1" ? record.phone : null,
+    district: record && record.lea_name !== "-1" ? record.lea_name : null,
+    ncesId: record?.ncessch ?? null,
   };
+
+  return { district: null, schools: [school] };
+}
+
+/**
+ * district mode: look up one of the scraped schools to grab the LEA id, pull
+ * the full district roster from nces, wrap every school as SchoolInfo, and
+ * produce a DistrictInfo carrying the district office address.
+ */
+async function resolveDistrict(
+  siteInfo: RawSiteInfo,
+  schoolUrl: string,
+  state: string | null,
+  teachers: Teacher[],
+  log: (msg: string) => void,
+  warnings: string[],
+): Promise<{ district: DistrictInfo | null; schools: SchoolInfo[] }> {
+  // find a seed school to resolve the LEA id: try scraper-listed schools first,
+  // then teachers' assigned schools, then the district name as a last resort.
+  const seedCandidates = [
+    ...(siteInfo.schools ?? []),
+    ...teachers.map((t) => t.schoolName).filter((s): s is string => !!s),
+    siteInfo.name ?? "",
+  ].filter((s) => s.trim().length > 0);
+
+  let seedRecord: NCESSchoolRecord | null = null;
+  for (const candidate of dedupeStrings(seedCandidates)) {
+    seedRecord = await lookupSchool(candidate, state ?? undefined);
+    if (seedRecord) {
+      log(`seeded district lookup via ${seedRecord.school_name} (LEA ${seedRecord.leaid})`);
+      break;
+    }
+  }
+
+  if (!seedRecord) {
+    log("no NCES match for any school in the district — falling back to scraped data");
+    warnings.push("district not found in NCES database — addresses may be incomplete");
+
+    // fallback: emit a synthetic SchoolInfo per scraped school name so csv still renders
+    const fallbackSchools: SchoolInfo[] = (siteInfo.schools ?? []).map((name) => ({
+      name,
+      url: schoolUrl,
+      address: null,
+      phone: null,
+      district: siteInfo.name ?? null,
+      ncesId: null,
+    }));
+
+    const district: DistrictInfo = {
+      name: siteInfo.name ?? "Unknown District",
+      leaId: null,
+      url: schoolUrl,
+      officeAddress: parseAddress(siteInfo.address),
+    };
+
+    return { district, schools: fallbackSchools };
+  }
+
+  // pull the full LEA roster
+  const roster = await lookupSchoolsInDistrict(seedRecord.leaid);
+  log(`loaded ${roster.length} schools from NCES for LEA ${seedRecord.leaid}`);
+
+  const schools: SchoolInfo[] = roster.map((r) => ({
+    name: r.school_name,
+    url: schoolUrl,
+    address: ncesRecordToAddress(r),
+    phone: r.phone !== "-1" ? r.phone : null,
+    district: r.lea_name !== "-1" ? r.lea_name : null,
+    ncesId: r.ncessch,
+  }));
+
+  // synthesize SchoolInfo entries for schools that exist on the site under a
+  // shared-campus umbrella but aren't listed individually in NCES (e.g.
+  // "Williston Schools" in NCES covers both "Williston Central School" and
+  // "Allen Brook School" on the site). the synthetic entries inherit the
+  // umbrella's address/phone/ncesId so teachers get correct federal data,
+  // while keeping their site-level display name.
+  const rosterShim = roster.map(
+    (r) => ({ school_name: r.school_name, ncessch: r.ncessch } as NCESSchoolRecord),
+  );
+
+  // track NCES umbrella ids that we've split into members — we drop the
+  // umbrella SchoolInfo once its members are synthesized so no teacher row
+  // ever falls back to the umbrella name.
+  const splitUmbrellaIds = new Set<string>();
+
+  for (const group of siteInfo.schoolGroups ?? []) {
+    const umbrellaMatch = matchSchoolInDistrict(group.umbrella, rosterShim);
+    if (!umbrellaMatch) continue;
+
+    const umbrellaSchool = schools.find((s) => s.ncesId === umbrellaMatch.ncessch);
+    if (!umbrellaSchool) continue;
+
+    let addedAny = false;
+    for (const memberName of group.members) {
+      const alreadyExists = schools.some(
+        (s) => s.name.toLowerCase() === memberName.toLowerCase(),
+      );
+      if (alreadyExists) continue;
+
+      schools.push({
+        name: memberName,
+        url: schoolUrl,
+        address: umbrellaSchool.address,
+        phone: umbrellaSchool.phone,
+        district: umbrellaSchool.district,
+        ncesId: umbrellaSchool.ncesId,
+      });
+      addedAny = true;
+    }
+
+    if (addedAny && umbrellaSchool.ncesId) {
+      splitUmbrellaIds.add(umbrellaSchool.ncesId);
+    }
+  }
+
+  // second-chance umbrella routing: catch scraped schools that (a) don't match
+  // any NCES record directly and (b) weren't covered by the scraper's
+  // schoolGroups. this happens when a scraped child-school doesn't share a
+  // first-word prefix with its umbrella (e.g. "Allen Brook School" is
+  // physically part of "Williston Schools" but the scraper's heuristic only
+  // linked "Williston Central School" as a member via first-word match). if
+  // the NCES roster has a plural-"Schools" umbrella record, route unmatched
+  // scraped schools through it so their federal address/phone still resolves.
+  const ncesUmbrellas = roster.filter(
+    (r) =>
+      /\bschools\s*$/i.test(r.school_name) &&
+      r.school_name.split(/\s+/).length >= 2,
+  );
+
+  if (ncesUmbrellas.length > 0) {
+    const existingNames = new Set(schools.map((s) => s.name.toLowerCase()));
+
+    for (const scrapedName of siteInfo.schools ?? []) {
+      const lower = scrapedName.toLowerCase();
+      if (existingNames.has(lower)) continue;
+      // skip if the fuzzy matcher resolves it to a real NCES record already
+      if (matchSchoolInDistrict(scrapedName, rosterShim)) continue;
+
+      // pick the best-matching umbrella. if exactly one umbrella exists, route
+      // there. with multiple umbrellas, require a first-word match with the
+      // scraped name OR a first-word match with any other scraped school already
+      // linked to that umbrella via the scraper's schoolGroups — a transitive
+      // signal that the unmatched school lives on the same campus. if neither
+      // signal holds, skip (district-office fallback beats a wrong-campus guess).
+      let target: NCESSchoolRecord | null = null;
+      if (ncesUmbrellas.length === 1) {
+        target = ncesUmbrellas[0]!;
+      } else {
+        const scrapedFirst = scrapedName.toLowerCase().split(/\s+/)[0] ?? "";
+        // direct first-word match
+        target =
+          ncesUmbrellas.find(
+            (u) => u.school_name.toLowerCase().split(/\s+/)[0] === scrapedFirst,
+          ) ?? null;
+
+        // transitive match: find an umbrella that the scraper already grouped
+        // with a sibling scraped school in the same campus. if the scraped
+        // school shares a campus with a grouped member (same first-word), route
+        // to that umbrella.
+        if (!target) {
+          for (const group of siteInfo.schoolGroups ?? []) {
+            const siblingFirst = group.members
+              .map((m) => m.toLowerCase().split(/\s+/)[0])
+              .find((w) => w === scrapedFirst);
+            if (!siblingFirst) continue;
+            const umbrellaRecord = ncesUmbrellas.find(
+              (u) =>
+                u.school_name.toLowerCase().split(/\s+/)[0] ===
+                group.umbrella.toLowerCase().split(/\s+/)[0],
+            );
+            if (umbrellaRecord) {
+              target = umbrellaRecord;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!target) {
+        warnings.push(
+          `could not route "${scrapedName}" to an NCES umbrella — ambiguous between multiple umbrellas; address falls back to district office`,
+        );
+        continue;
+      }
+
+      const umbrellaSchool = schools.find((s) => s.ncesId === target.ncessch);
+      if (!umbrellaSchool) continue;
+
+      schools.push({
+        name: scrapedName,
+        url: schoolUrl,
+        address: umbrellaSchool.address,
+        phone: umbrellaSchool.phone,
+        district: umbrellaSchool.district,
+        ncesId: umbrellaSchool.ncesId,
+      });
+      existingNames.add(lower);
+    }
+  }
+
+  const district: DistrictInfo = {
+    name: seedRecord.lea_name !== "-1" ? seedRecord.lea_name : siteInfo.name ?? "Unknown District",
+    leaId: seedRecord.leaid,
+    url: schoolUrl,
+    // district office address: nces doesn't ship this on the school record, so
+    // fall back to what the scraper found on the district site.
+    officeAddress: parseAddress(siteInfo.address),
+  };
+
+  // drop NCES umbrella records that have been split into their member schools
+  // via schoolGroups. the umbrella's address/phone/ncesId live on in each
+  // member via inheritance, so removing the umbrella entry doesn't lose data —
+  // it just prevents downstream "X Schools" entries with zero teachers from
+  // inflating the school count and confusing the summary UI.
+  //
+  // an entry is the "original umbrella" (not a synthesized member) when its
+  // name matches the NCES roster's school_name for that ncesId.
+  const finalSchools = schools.filter((s) => {
+    if (!s.ncesId || !splitUmbrellaIds.has(s.ncesId)) return true;
+    const rosterMatch = roster.find((r) => r.ncessch === s.ncesId);
+    const isOriginalUmbrella =
+      !!rosterMatch &&
+      rosterMatch.school_name.toLowerCase() === s.name.toLowerCase();
+    return !isOriginalUmbrella;
+  });
+
+  return { district, schools: finalSchools };
+}
+
+/**
+ * for each teacher, resolve their schoolName/schoolNcesId to a school record
+ * in the roster. in single-school mode everyone maps to schools[0]; in
+ * district mode each teacher's scraped assignedSchool is fuzzy-matched against
+ * the roster.
+ */
+function resolveTeacherSchools(
+  teachers: Teacher[],
+  schools: SchoolInfo[],
+  district: DistrictInfo | null,
+  warnings: string[],
+): void {
+  if (schools.length === 0) return;
+
+  // single-school mode: everyone goes to the one school
+  if (!district) {
+    const only = schools[0]!;
+    for (const t of teachers) {
+      t.schoolName = only.name;
+      t.schoolNcesId = only.ncesId;
+    }
+    return;
+  }
+
+  // district mode: map scraped assignedSchool → nces record in the roster.
+  // build a pseudo-roster of NCESSchoolRecord-shaped candidates so we can reuse
+  // the matcher (it only needs school_name + ncessch).
+  const rosterShim = schools
+    .filter((s) => s.ncesId)
+    .map((s) => ({ school_name: s.name, ncessch: s.ncesId! } as NCESSchoolRecord));
+
+  const unmatched = new Set<string>();
+
+  for (const t of teachers) {
+    if (!t.schoolName) {
+      // teacher missing a school assignment — leave unresolved; csv will fall back
+      warnings.push(`teacher ${t.firstName} ${t.lastName} has no school assignment`);
+      continue;
+    }
+
+    const match = matchSchoolInDistrict(t.schoolName, rosterShim);
+    if (match) {
+      const resolved = schools.find((s) => s.ncesId === match.ncessch);
+      if (resolved) {
+        t.schoolName = resolved.name;
+        t.schoolNcesId = resolved.ncesId;
+        continue;
+      }
+    }
+
+    unmatched.add(t.schoolName);
+  }
+
+  if (unmatched.size > 0) {
+    warnings.push(
+      `could not match ${unmatched.size} scraped school name(s) to NCES district roster: ${[...unmatched].join(", ")}`,
+    );
+  }
+}
+
+/** finds the SchoolInfo corresponding to a teacher, or null */
+function findSchoolForTeacher(
+  teacher: Teacher,
+  schools: SchoolInfo[],
+): SchoolInfo | null {
+  if (teacher.schoolNcesId) {
+    const byId = schools.find((s) => s.ncesId === teacher.schoolNcesId);
+    if (byId) return byId;
+  }
+  if (teacher.schoolName) {
+    const byName = schools.find(
+      (s) => s.name.toLowerCase() === teacher.schoolName!.toLowerCase(),
+    );
+    if (byName) return byName;
+  }
+  return null;
+}
+
+/** dedupe while preserving order */
+function dedupeStrings(arr: string[]): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const s of arr) {
+    const key = s.trim().toLowerCase();
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
 }
 
 /** tries to pull a 2-letter state code from an address string or url */
