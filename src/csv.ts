@@ -113,6 +113,21 @@ export function generateCsv(result: ScrapeResult): string {
   return [header, ...rows].join("\n") + "\n";
 }
 
+/**
+ * concatenate multiple ScrapeResults into a single CSV — one header, then all
+ * teacher rows from all results in order. the schema is unchanged (source_url
+ * already identifies which site each teacher came from), so consumers don't
+ * need to handle a new column. used by batch mode's --merged-output.
+ */
+export function generateMergedCsv(results: ScrapeResult[]): string {
+  const header = HEADERS.join(",");
+  const rows: string[] = [];
+  for (const r of results) {
+    for (const t of r.teachers) rows.push(teacherToRow(t, r));
+  }
+  return [header, ...rows].join("\n") + "\n";
+}
+
 export async function writeCsv(filePath: string, content: string): Promise<void> {
   await mkdir(dirname(filePath), { recursive: true });
   await Bun.write(filePath, content);

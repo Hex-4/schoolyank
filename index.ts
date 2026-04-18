@@ -8,6 +8,7 @@ import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { run, PHASE_LABELS, type PhaseId } from "./src/orchestrator";
 import { slugify } from "./src/utils";
+import { generateMergedCsv, writeCsv } from "./src/csv";
 import type { ScrapeConfig, ScrapeResult, Teacher } from "./src/types";
 
 const ENV_FILE = resolve(".env");
@@ -269,9 +270,128 @@ async function ensureExaKey(): Promise<string | null> {
 	}
 }
 
+// ── cli argv parsing ─────────────────────────────────────────────────────────
+
+interface CliFlags {
+	urls: string[];
+	urlsFile: string | null;
+	enableLinkedin: boolean | null; // null = use interactive default
+	output: string | null;
+	mergedOutput: string | null;
+	concurrency: number;
+	force: boolean;
+	help: boolean;
+	interactive: boolean;
+}
+
+function parseArgs(argv: string[]): CliFlags {
+	const flags: CliFlags = {
+		urls: [],
+		urlsFile: null,
+		enableLinkedin: null,
+		output: null,
+		mergedOutput: null,
+		concurrency: 3,
+		force: false,
+		help: false,
+		interactive: false,
+	};
+
+	for (let i = 0; i < argv.length; i++) {
+		const a = argv[i]!;
+		const next = () => argv[++i];
+		switch (a) {
+			case "-h":
+			case "--help":
+				flags.help = true;
+				break;
+			case "--url":
+				flags.urls.push(next() ?? "");
+				break;
+			case "--urls-file":
+				flags.urlsFile = next() ?? null;
+				break;
+			case "--linkedin":
+				flags.enableLinkedin = true;
+				break;
+			case "--no-linkedin":
+				flags.enableLinkedin = false;
+				break;
+			case "--output":
+			case "-o":
+				flags.output = next() ?? null;
+				break;
+			case "--merged-output":
+				flags.mergedOutput = next() ?? null;
+				break;
+			case "--concurrency":
+			case "-j":
+				flags.concurrency = Math.max(1, Number(next()) || 3);
+				break;
+			case "--force":
+				flags.force = true;
+				break;
+			case "--interactive":
+				flags.interactive = true;
+				break;
+			default:
+				// bare positional args are treated as URLs — lets the user do
+				// `bun index.ts <url1> <url2>` without --url prefixes.
+				if (!a.startsWith("-")) flags.urls.push(a);
+				break;
+		}
+	}
+
+	return flags;
+}
+
+async function loadUrlsFromFile(path: string): Promise<string[]> {
+	const text = await Bun.file(path).text();
+	return text
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter((line) => line.length > 0 && !line.startsWith("#"));
+}
+
+function printHelp(): void {
+	const bin = t.bold("bun index.ts");
+	const lines = [
+		`${BRAND_TAG}  ${TAGLINE}`,
+		"",
+		`${t.bold("USAGE")}`,
+		`  ${bin}                        ${t.muted("interactive prompt (single school)")}`,
+		`  ${bin} <url>                  ${t.muted("scrape one school non-interactively")}`,
+		`  ${bin} <url1> <url2> ...      ${t.muted("batch (3-way parallel by default)")}`,
+		`  ${bin} --urls-file urls.txt   ${t.muted("batch from a file, one url per line")}`,
+		"",
+		`${t.bold("FLAGS")}`,
+		`  ${t.brand("--url")} <x>              add a url (repeatable)`,
+		`  ${t.brand("--urls-file")} <path>     read urls from a file (one per line, # for comments)`,
+		`  ${t.brand("--linkedin")}             enable linkedin enrichment`,
+		`  ${t.brand("--no-linkedin")}          disable linkedin enrichment`,
+		`  ${t.brand("--output, -o")} <path>    single-url output csv path (default: output/<slug>.csv)`,
+		`  ${t.brand("--merged-output")} <path> batch merged csv path (default: output/all.csv)`,
+		`  ${t.brand("--concurrency, -j")} <n>  parallel workers in batch (default 3, browser-use free-tier cap)`,
+		`  ${t.brand("--force")}                re-scrape even if output csv already exists`,
+		`  ${t.brand("--interactive")}          force interactive prompt even when urls are passed`,
+		`  ${t.brand("--help, -h")}             show this message`,
+		"",
+		`${t.bold("EXAMPLES")}`,
+		`  ${t.muted("# interactive run (guided CLI)")}`,
+		`  ${bin}`,
+		"",
+		`  ${t.muted("# one school, no prompts, linkedin on")}`,
+		`  ${bin} --url https://cvsdvt.org --linkedin`,
+		"",
+		`  ${t.muted("# batch 15 schools with 3-way parallelism, merged output")}`,
+		`  ${bin} --urls-file schools.txt --linkedin --merged-output output/all.csv`,
+	];
+	console.log(lines.join("\n"));
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
-async function main() {
+async function runInteractive(): Promise<void> {
 	p.intro(`${BRAND_TAG}  ${TAGLINE}`);
 
 	const config = await p.group(
@@ -484,6 +604,207 @@ async function main() {
 	}
 
 	p.outro(t.ok("done"));
+}
+
+// ── non-interactive batch mode ───────────────────────────────────────────────
+
+interface BatchItem {
+	url: string;
+	outputPath: string;
+	slug: string;
+}
+
+interface BatchOutcome {
+	item: BatchItem;
+	status: "ok" | "skipped" | "failed";
+	result?: ScrapeResult;
+	error?: string;
+	durationMs: number;
+}
+
+function defaultOutputPathFor(url: string): string {
+	const domain = new URL(url).hostname.replace(/^www\./, "");
+	return resolve("output", `${slugify(domain)}.csv`);
+}
+
+/**
+ * run one scrape non-interactively. emits short progress lines (one per
+ * milestone) instead of the spinner UI — batch mode can't use a spinner
+ * because multiple runs would fight for the same TTY line.
+ */
+async function scrapeOne(
+	url: string,
+	enableLinkedin: boolean,
+	outputPath: string,
+	tag: string,
+): Promise<ScrapeResult> {
+	const scrapeConfig: ScrapeConfig = { schoolUrl: url, enableLinkedin, outputPath };
+	return run(scrapeConfig, {
+		onStatus: () => {},
+		onPhase: (phase, idx, total) => {
+			console.log(`${t.muted(tag)} ${t.muted(`[${idx}/${total}]`)} ${t.bold(PHASE_LABELS[phase])}`);
+		},
+		onMilestone: (msg, level) => {
+			const prefix = level === "warn" ? t.warn("!") : t.ok("•");
+			console.log(`${t.muted(tag)} ${prefix} ${msg}`);
+		},
+		onLiveUrl: (liveUrl) => {
+			console.log(`${t.muted(tag)} ${t.muted("watch live:")} ${t.brand(liveUrl)}`);
+		},
+	});
+}
+
+/** fixed-size worker pool: always up to `concurrency` scrapes in flight. */
+async function runBatch(
+	items: BatchItem[],
+	enableLinkedin: boolean,
+	concurrency: number,
+	force: boolean,
+): Promise<BatchOutcome[]> {
+	const outcomes: BatchOutcome[] = new Array(items.length);
+	let cursor = 0;
+
+	async function worker(): Promise<void> {
+		while (true) {
+			const myIdx = cursor++;
+			if (myIdx >= items.length) break;
+			const item = items[myIdx]!;
+			const tag = `[${myIdx + 1}/${items.length} ${item.slug}]`;
+			const start = Date.now();
+
+			if (!force && existsSync(item.outputPath)) {
+				console.log(`${t.muted(tag)} ${t.muted("skipped (output exists — pass --force to re-scrape)")}`);
+				outcomes[myIdx] = {
+					item,
+					status: "skipped",
+					durationMs: Date.now() - start,
+				};
+				continue;
+			}
+
+			console.log(`${t.muted(tag)} ${t.bold("starting")} ${t.brand(item.url)}`);
+			try {
+				const result = await scrapeOne(item.url, enableLinkedin, item.outputPath, tag);
+				const dur = ((Date.now() - start) / 1000).toFixed(1);
+				console.log(
+					`${t.muted(tag)} ${t.ok("✓ done")} ${t.accent(String(result.teachers.length))} ${t.muted("teachers")} ${t.muted(`(${dur}s)`)}`,
+				);
+				outcomes[myIdx] = {
+					item,
+					status: "ok",
+					result,
+					durationMs: Date.now() - start,
+				};
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.log(`${t.muted(tag)} ${t.bad("✗ failed:")} ${msg}`);
+				outcomes[myIdx] = {
+					item,
+					status: "failed",
+					error: msg,
+					durationMs: Date.now() - start,
+				};
+			}
+		}
+	}
+
+	const workerCount = Math.max(1, Math.min(concurrency, items.length));
+	await Promise.all(Array.from({ length: workerCount }, worker));
+	return outcomes;
+}
+
+async function runNonInteractive(flags: CliFlags): Promise<void> {
+	// aggregate URL inputs: --url repeats + positionals + --urls-file
+	let urls = [...flags.urls];
+	if (flags.urlsFile) {
+		try {
+			const fileUrls = await loadUrlsFromFile(flags.urlsFile);
+			urls = urls.concat(fileUrls);
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.error(t.bad(`failed to read urls file: ${msg}`));
+			process.exit(1);
+		}
+	}
+
+	// validate URLs, drop bad ones with a warning (don't crash the whole batch)
+	const valid: string[] = [];
+	for (const u of urls) {
+		try {
+			new URL(u);
+			valid.push(u);
+		} catch {
+			console.error(t.warn(`skipping invalid url: ${u}`));
+		}
+	}
+	if (valid.length === 0) {
+		console.error(t.bad("no valid urls — see --help"));
+		process.exit(1);
+	}
+
+	const enableLinkedin = flags.enableLinkedin ?? true;
+
+	// build work items with output paths. --output only applies when there's
+	// exactly one url; batches always route through output/<slug>.csv because
+	// a single --output would overwrite itself across runs.
+	const items: BatchItem[] = valid.map((url, i) => {
+		const domain = new URL(url).hostname.replace(/^www\./, "");
+		const slug = slugify(domain);
+		const outputPath =
+			valid.length === 1 && flags.output
+				? resolve(flags.output)
+				: defaultOutputPathFor(url);
+		return { url, outputPath, slug };
+	});
+
+	console.log(`${BRAND_TAG}  ${t.muted(`${items.length} school${items.length === 1 ? "" : "s"}, concurrency ${flags.concurrency}`)}`);
+	if (enableLinkedin && !process.env.EXA_API_KEY) {
+		console.log(t.warn("! linkedin enabled but EXA_API_KEY not set — falling back to DDG scrape (lower hit rate)"));
+	}
+
+	const batchStart = Date.now();
+	const outcomes = await runBatch(items, enableLinkedin, flags.concurrency, flags.force);
+	const batchDurationSec = ((Date.now() - batchStart) / 1000).toFixed(1);
+
+	// merged CSV for batches of 2+ (or always when --merged-output is passed)
+	const okOutcomes = outcomes.filter((o) => o.status === "ok" && o.result);
+	if (okOutcomes.length > 0 && (items.length > 1 || flags.mergedOutput)) {
+		const mergedPath = resolve(flags.mergedOutput ?? "output/all.csv");
+		const csv = generateMergedCsv(okOutcomes.map((o) => o.result!));
+		await writeCsv(mergedPath, csv);
+		const totalTeachers = okOutcomes.reduce((n, o) => n + o.result!.teachers.length, 0);
+		console.log(`${t.ok("✓")} merged csv: ${t.brand(mergedPath)} ${t.muted(`(${totalTeachers} teachers across ${okOutcomes.length} schools)`)}`);
+	}
+
+	// summary
+	const ok = outcomes.filter((o) => o.status === "ok").length;
+	const skipped = outcomes.filter((o) => o.status === "skipped").length;
+	const failed = outcomes.filter((o) => o.status === "failed");
+	console.log();
+	console.log(
+		`${t.bold("batch summary")}  ${t.ok(`${ok} ok`)}  ${t.muted(`${skipped} skipped`)}  ${failed.length > 0 ? t.bad(`${failed.length} failed`) : t.muted("0 failed")}  ${t.muted(`${batchDurationSec}s total`)}`,
+	);
+	if (failed.length > 0) {
+		for (const f of failed) console.log(`  ${t.bad("✗")} ${f.item.url} — ${f.error}`);
+		process.exit(1);
+	}
+}
+
+// ── entry point ──────────────────────────────────────────────────────────────
+
+async function main(): Promise<void> {
+	const flags = parseArgs(Bun.argv.slice(2));
+	if (flags.help) {
+		printHelp();
+		return;
+	}
+
+	const hasUrls = flags.urls.length > 0 || !!flags.urlsFile;
+	if (flags.interactive || !hasUrls) {
+		await runInteractive();
+	} else {
+		await runNonInteractive(flags);
+	}
 }
 
 main();

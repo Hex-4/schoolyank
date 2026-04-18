@@ -27,15 +27,31 @@ AI_MODEL=kr/claude-sonnet-4.5
 
 ## usage
 
+interactive (guided prompts):
+
 ```bash
 bun index.ts
 ```
 
-interactive cli will prompt for:
-- school website url
-- linkedin enrichment (optional)
+non-interactive (single school):
 
-output csv lands in `./output/`.
+```bash
+bun index.ts --url https://cvsdvt.org --linkedin
+```
+
+batch (up to 3 schools in parallel, merged csv output):
+
+```bash
+# from a file, one url per line (# for comments)
+bun index.ts --urls-file schools.txt --linkedin
+
+# or inline
+bun index.ts https://cvsdvt.org https://sbhs.sbschools.net --linkedin
+```
+
+per-school csvs land in `./output/<slug>.csv`; batches also get a combined `./output/all.csv` with one row per teacher across every school. re-running skips schools whose csv already exists (pass `--force` to re-scrape).
+
+run `bun index.ts --help` for all flags.
 
 ## linkedin enrichment
 
