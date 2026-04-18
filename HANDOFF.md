@@ -1,6 +1,6 @@
 # schoolyank session handoff
 
-snapshot of where things stand after the 2026-04-17 session. start here if you're picking this up fresh.
+snapshot of where things stand after the 2026-04-17 session (day 2 — added llm judges, batch mode, email validation, CLI flags). start here if you're picking this up fresh.
 
 ## what it does
 
@@ -10,20 +10,27 @@ extracts STEM teacher contact data from any K-12 school or district website → 
 
 ```bash
 bun install
-cp .env.example .env   # set BROWSER_USE_API_KEY, optionally EXA_API_KEY
-bun index.ts
+cp .env.example .env   # set BROWSER_USE_API_KEY, optionally EXA_API_KEY + AI_BASE_URL
+bun index.ts                                            # interactive (one school)
+bun index.ts --url https://cvsdvt.org --linkedin        # one school, non-interactive
+bun index.ts --urls-file schools.txt --linkedin         # batch (3-way parallel)
+bun index.ts --help                                     # full flag reference
 ```
 
-the CLI will prompt for a school URL and whether to enable LinkedIn enrichment. if you enable LinkedIn and don't have an Exa key, a setup wizard opens the Exa signup page, prompts for the pasted key, and saves it to `.env` for future runs.
+the interactive CLI prompts for a school URL and whether to enable LinkedIn enrichment. if LinkedIn is enabled and no Exa key is set, a setup wizard opens the Exa signup page, prompts for the pasted key, and saves it to `.env` for future runs. non-interactive mode skips prompts; missing EXA_API_KEY falls back to DDG scraping with a warning.
+
+batch mode caps at 3 concurrent scrapes (browser-use free-tier limit), skips any school whose output csv already exists (override with `--force`), retries each failing school once before giving up, and writes both per-school `output/<slug>.csv` files + a merged `output/all.csv` covering every teacher across every school.
 
 ## pipeline (6 phases)
 
-1. **classify** — is the URL a district or single-school site? (structured zod output via browser-use)
+1. **classify** — is the URL a district or single-school site? (structured zod output via browser-use). follow-up umbrella-probe task drills into plural "X Schools" labels and enumerates their member schools so downstream assignment goes per-building instead of per-umbrella.
 2. **directory** — find staff directory URL(s) (navigation context for the next task)
-3. **extract** — pull every STEM teacher with per-teacher school assignment (structured zod output)
+3. **extract** — pull every STEM teacher with per-teacher school assignment (structured zod output on `claude-sonnet-4.6` for better recall; classify/directory stay on `gpt-5.4-mini` for cost)
 4. **NCES verify** — resolve each school to its federal NCES record for canonical address/phone
-5. **linkedin** — optional: search Exa's "people" index (linkedin-gated) for profile URL + job title
-6. **export** — write CSV
+5. **LLM judge passes** — one batch call classifies STEM + hacker score per teacher; one batch call adjudicates LinkedIn candidates. Keyword fallbacks run silently if the LLM errors.
+6. **email validation** — DNS MX lookup + SMTP RCPT TO probe (one connection per domain, reused for every teacher). Confirmed 550/551/553 = null the email out; timeouts = inconclusive, kept.
+7. **linkedin** — optional: batch Exa candidates (name + not-retired prefilter) → LLM picks the true match per teacher. Falls back to keyword validator on LLM failure.
+8. **export** — write per-school CSV + optional merged CSV
 
 ## stack
 
@@ -33,9 +40,11 @@ the CLI will prompt for a school URL and whether to enable LinkedIn enrichment. 
 | federal school data | Urban Institute NCES API (free, no auth) |
 | linkedin profile lookup | Exa `category: "people"` (1000 req/mo free) |
 | linkedin fallback | DDG HTML scrape (always on, rate-limited) |
-| CLI | `@clack/prompts` with theme in `index.ts` |
+| STEM classification + hacker score + linkedin judge | openai-compatible LLM endpoint (see `src/judge.ts`) — batch calls, keyword fallbacks |
+| email validation | DNS MX + SMTP RCPT TO (see `src/emailValidator.ts`) — no API keys |
+| CLI | `@clack/prompts` interactive + custom argv parser for batch/non-interactive mode |
 
-all knobs are in environment variables (bun auto-loads `.env`). the only required key is `BROWSER_USE_API_KEY`. `EXA_API_KEY` is optional (fall back to DDG scrape).
+only `BROWSER_USE_API_KEY` is required. `EXA_API_KEY` → better LinkedIn recall. `AI_BASE_URL` + `AI_MODEL` + `AI_API_KEY` → LLM judges (any openai-compatible endpoint). missing any optional key degrades gracefully with a warning.
 
 ## key design decisions
 
@@ -73,16 +82,24 @@ total runtime: ~3 min (was ~12 min before Finalsite-specific prompt hints landed
 ## file map
 
 ```
-index.ts                      cli entry, progress rendering, Exa setup wizard
+index.ts                      argv parser + interactive CLI + batch runner
+                              (preflight check for BROWSER_USE_API_KEY, retry-once
+                              on browser-use failures, merged-csv writer)
 src/
-  orchestrator.ts             pipeline glue — all phases, NCES routing, warnings
-  scraper.ts                  browser-use tasks + Finalsite-aware prompts
-  linkedin.ts                 Exa + DDG providers, 3-phase validation
+  orchestrator.ts             pipeline glue — all phases, NCES routing, LLM judges,
+                              email validation, warnings
+  scraper.ts                  browser-use tasks + Finalsite-aware prompts +
+                              umbrella-probe follow-up task
+  linkedin.ts                 two-phase Exa enrichment (fetch candidates → batch
+                              LLM judge) + DDG fallback + exa rate-limit token bucket
+  judge.ts                    batch LLM judges: STEM+hacker_score, linkedin match
+  emailValidator.ts           DNS MX + SMTP RCPT TO, no API keys, port-25 fast-fail
   nces.ts                     Urban Institute API client + fuzzy matcher
-  validator.ts                STEM filter, email inference, confidence scoring
-  csv.ts                      per-teacher school lookup + CSV output
+  validator.ts                name/email/dedup/confidence + keyword fallbacks for
+                              STEM and hacker_score (used when LLM judge errors)
+  csv.ts                      per-teacher school lookup + per-school + merged CSV
   browser.ts                  browser-use SDK wrapper (runTask + runTaskStructured)
-  ai.ts                       legacy openai client — mostly unused now
+  ai.ts                       openai-compatible llm client used by judge.ts
   types.ts                    shared types (Teacher, SchoolInfo, DistrictInfo, etc.)
   utils.ts                    name/email normalization, fuzzy helpers
 ```

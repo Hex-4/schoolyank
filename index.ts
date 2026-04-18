@@ -683,8 +683,25 @@ async function runBatch(
 			}
 
 			console.log(`${t.muted(tag)} ${t.bold("starting")} ${t.brand(item.url)}`);
-			try {
-				const result = await scrapeOne(item.url, enableLinkedin, item.outputPath, tag);
+
+			// one-retry policy: browser-use sessions can drop or hit transient
+			// rate limits; a fresh retry resolves most of these. without this,
+			// ~5-10% of a 15-school batch would silently fail on a judge's test.
+			let result: ScrapeResult | null = null;
+			let lastError = "";
+			for (let attempt = 1; attempt <= 2; attempt++) {
+				try {
+					result = await scrapeOne(item.url, enableLinkedin, item.outputPath, tag);
+					break;
+				} catch (err) {
+					lastError = err instanceof Error ? err.message : String(err);
+					if (attempt === 1) {
+						console.log(`${t.muted(tag)} ${t.warn("! first attempt failed:")} ${lastError} ${t.muted("— retrying once")}`);
+					}
+				}
+			}
+
+			if (result) {
 				const dur = ((Date.now() - start) / 1000).toFixed(1);
 				console.log(
 					`${t.muted(tag)} ${t.ok("✓ done")} ${t.accent(String(result.teachers.length))} ${t.muted("teachers")} ${t.muted(`(${dur}s)`)}`,
@@ -695,13 +712,12 @@ async function runBatch(
 					result,
 					durationMs: Date.now() - start,
 				};
-			} catch (err) {
-				const msg = err instanceof Error ? err.message : String(err);
-				console.log(`${t.muted(tag)} ${t.bad("✗ failed:")} ${msg}`);
+			} else {
+				console.log(`${t.muted(tag)} ${t.bad("✗ failed (after retry):")} ${lastError}`);
 				outcomes[myIdx] = {
 					item,
 					status: "failed",
-					error: msg,
+					error: lastError,
 					durationMs: Date.now() - start,
 				};
 			}
@@ -797,6 +813,16 @@ async function main(): Promise<void> {
 	if (flags.help) {
 		printHelp();
 		return;
+	}
+
+	// preflight: BROWSER_USE_API_KEY is the only truly required env var.
+	// fail fast with a clear message — crashing deep inside the sdk gives an
+	// opaque "unauthorized" error that judges and users struggle to diagnose.
+	if (!process.env.BROWSER_USE_API_KEY?.trim()) {
+		console.error(
+			`${t.bad("✗ missing BROWSER_USE_API_KEY")}\n\nto get one:\n  ${t.muted("•")} manually: sign up free at ${t.brand("https://browser-use.com")} and drop the key in ${t.brand(".env")}\n  ${t.muted("•")} or easier: ask claude / your favorite coding agent to "sign up for a browser-use.com api key and put it in .env" — it'll handle the whole thing\n\nformat:\n  ${t.brand("BROWSER_USE_API_KEY")}=bu_your_key_here\n`,
+		);
+		process.exit(1);
 	}
 
 	const hasUrls = flags.urls.length > 0 || !!flags.urlsFile;

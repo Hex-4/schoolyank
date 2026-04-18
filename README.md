@@ -21,9 +21,19 @@ set your api key in `.env`:
 
 ```
 BROWSER_USE_API_KEY=bu_your_key_here
-AI_BASE_URL=http://localhost:20128/v1
-AI_MODEL=kr/claude-sonnet-4.5
+
+# optional — only needed if you want llm-graded STEM filtering + linkedin
+# validation instead of keyword heuristics. any openai-compatible endpoint works.
+AI_BASE_URL=https://api.anthropic.com/v1
+AI_MODEL=claude-sonnet-4-6
+AI_API_KEY=sk-...
+
+# optional — linkedin enrichment works without this via DDG scrape, but
+# exa is ~5× more accurate. free tier = 1000 req/month, no credit card.
+EXA_API_KEY=...
 ```
+
+`BROWSER_USE_API_KEY` is the only required key. get one free at [browser-use.com](https://browser-use.com), or ask your favorite coding agent (claude, codex, cursor, etc) to "sign up for a browser-use.com api key and put it in .env" — they can handle the whole flow autonomously.
 
 ## usage
 
