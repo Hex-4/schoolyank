@@ -1,153 +1,45 @@
 # schoolyank
 
-extract science, math, and stem teacher data from any school website.
+vibe coded script to extract stem teacher data from a school URL.
 
-given a school url → outputs a csv with names, emails, mailing addresses, roles, and enriched details for every stem teacher.
+this got very complicated, very fast. shoutout to claude code and the ollama free tier. sort by hacker_score descending in the CSV for high-value targets.
 
-## how it works
-
-1. **browser-use** ai agent crawls the school website, finds the staff directory, and extracts stem teacher data
-2. **nces database** (us dept of education) verifies the school's mailing address
-3. **linkedin** (optional) enriches teacher profiles with full titles and profile urls
-4. **validation pipeline** cleans, deduplicates, infers missing emails, and scores confidence
-
-## setup
+to get started:
 
 ```bash
-bun install
+git clone https://github.com/Hex-4/schoolyank
+bun index.ts # if .env doesn't exist, runs setup first
 ```
 
-set your api key in `.env`:
+make sure you have a hack club AI or openrouter key ready. the setup script will help you set up an LLM API, and then use it to autonomously sign up for Browser Use (via the agent-specific challenge-response flow) and the Exa search API (via a browser use agent). Keys are saved to .env automatically.
 
-```
-BROWSER_USE_API_KEY=bu_your_key_here
-
-# optional — only needed if you want llm-graded STEM filtering + linkedin
-# validation instead of keyword heuristics. any openai-compatible endpoint works.
-AI_BASE_URL=https://api.anthropic.com/v1
-AI_MODEL=claude-sonnet-4-6
-AI_API_KEY=sk-...
-
-# optional — linkedin enrichment works without this via DDG scrape, but
-# exa is ~5× more accurate. free tier = 1000 req/month, no credit card.
-EXA_API_KEY=...
-```
-
-`BROWSER_USE_API_KEY` is the only required key. get one free at [browser-use.com](https://browser-use.com), or ask your favorite coding agent (claude, codex, cursor, etc) to "sign up for a browser-use.com api key and put it in .env" — they can handle the whole flow autonomously.
+script does this:
+- spins up a browser use agent to figure out if the site is a district or a single school
+- the agent traverses staff directories and lists stem teachers
+- claude wrote a ton of smart code that validates and normalizes what the agent returned
+- sends validated listing to an LLM judge - the judge strips non-stem teachers that slipped in and assigns a hacker score to teachers (CS, robotics, etc get high scores, math and etc get lower scores)
+- attempts to validate emails (doesn't work on many home networks)
+- hits the NCES government database to get better addresses
+- uses Exa's people search vertical to get linkedin URLs and better job titles for teachers
+- exports to csv
+whole pipeline takes ~3min for a 50-teacher district. main slowdown is the browser use agent.
 
 ## usage
+the interactive mode (just `bun index.ts`) works great. but if you hate joy and pretty colors, run with flags instead:
+- `--url https://example.com` for one url. `--urls-file schools.txt` reads schools one-per-line, ignoring lines that start with #.
+- `--output` or `-o` to change the filename for one-school mode. `--merged-output` merges all results from running on multiple schools into one CSV.
+- `--linkedin` to enable linkedin enrichment. recommended.
+- `-j <n>` to adjust concurrency in batch mode. Browser Use free tier limit is 3 - probably shouldn't go above that.
+- `--force` to overwrite previous CSVs
+- `--debug` dumps detailed information, useful to debug flaky or weird sites
 
-interactive (guided prompts):
+## limitations
+- sites that don't expose staff emails -> blank column. the script can infer email formats if given >3 seeds, but can't if the site itself only exposes, say, a contact form
+- smtp validation doesn't work on most home networks since port 25 is blocked
+- federated districts (with per-school subsites and no combined directory) have limited coverage (10-50%)
+- amount of found teachers can vary by like 5% each run and i cant fix it sowwy :(
+- doesn't work on reCAPTCHAd sites or login-walled sites
+- some sites obfuscate emails. finalsite is handled but not other formats
+- Exa LinkedIn index is incomplete (10%-60% hit rate) and the free tier has only ~1k searches per mo
 
-```bash
-bun index.ts
-```
-
-non-interactive (single school):
-
-```bash
-bun index.ts --url https://cvsdvt.org --linkedin
-```
-
-batch (up to 3 schools in parallel, merged csv output):
-
-```bash
-# from a file, one url per line (# for comments)
-bun index.ts --urls-file schools.txt --linkedin
-
-# or inline
-bun index.ts https://cvsdvt.org https://sbhs.sbschools.net --linkedin
-```
-
-per-school csvs land in `./output/<slug>.csv`; batches also get a combined `./output/all.csv` with one row per teacher across every school. re-running skips schools whose csv already exists (pass `--force` to re-scrape).
-
-run `bun index.ts --help` for all flags.
-
-## linkedin enrichment
-
-linkedin enrichment requires a browser-use profile with linkedin authentication. the cli guides you through setup.
-
-### first-time setup
-
-when you enable linkedin enrichment for the first time, you'll need to sync your linkedin cookies:
-
-1. log into linkedin in a local chromium-based browser (chrome, edge, etc.)
-
-2. schoolyank will show you the sync command:
-   ```bash
-   curl -fsSL https://browser-use.com/profile.sh | sh
-   ```
-
-3. run it in a separate terminal - the script will prompt for your browser-use API key
-
-4. paste your API key (schoolyank shows it for you)
-
-5. select the browser profile where you're logged into linkedin
-
-6. return to schoolyank and confirm the sync is complete
-
-7. select your newly synced profile from the list
-
-### after first setup
-
-once you've synced a profile, schoolyank remembers it:
-
-```
-◆ schoolyank
-
-│ school website url: https://example.edu
-│ enable linkedin enrichment? yes
-│
-◇ use saved linkedin profile (linkedin-profile)? yes
-│
-◇ starting scrape...
-```
-
-to use a different profile or re-sync, select "sync new profile" when prompted.
-
-profiles are cached in `profiles/config.json`.
-
-### how it works
-
-- the sync script opens your local browser where you control the login
-- cookies are uploaded to browser-use's cloud and stored in a profile
-- the agent uses your linkedin session to search for teacher profiles
-- one profile can be reused across multiple runs
-
-## csv columns
-
-| column | description |
-|--------|-------------|
-| first_name | teacher's first name |
-| last_name | teacher's last name |
-| email | email address (verified or inferred) |
-| role | teaching role / title |
-| department | department (science, math, etc.) |
-| school_name | official school name |
-| school_address | mailing address (nces-verified when possible) |
-| school_city | city |
-| school_state | state |
-| school_zip | zip code |
-| school_phone | school phone number |
-| school_district | district name |
-| linkedin_url | linkedin profile url (if enriched) |
-| data_sources | where each data point came from |
-| confidence_score | 1-5 data quality score |
-
-## architecture
-
-see [DESIGN.md](./DESIGN.md) for the full design document.
-
-```
-index.ts              → cli (clack/prompts)
-src/orchestrator.ts   → coordinates the 4-phase pipeline
-src/scraper.ts        → browser-use school website extraction
-src/nces.ts           → federal school database lookup
-src/linkedin.ts       → optional linkedin enrichment
-src/validator.ts      → data quality pipeline
-src/csv.ts            → csv export
-src/ai.ts             → openai-compatible llm client
-src/browser.ts        → browser-use session management
-src/types.ts          → shared types
-src/utils.ts          → helpers
-```
+thats it, be free and go spam some teachers /j :)
