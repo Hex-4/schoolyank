@@ -342,6 +342,26 @@ function isSiteRolePlaceholder(role: string | null | undefined): boolean {
   return /^(teacher|educator|instructor|staff|faculty|employee|professional)s?$/.test(trimmed);
 }
 
+/**
+ * pick the best role to emit when the site role is a placeholder ("Teacher").
+ * prefers a clean synthesized `"${department} Teacher"` when we have the
+ * subject — linkedin headlines carry bio noise ("MBA", "PhD Student",
+ * "State Employed at State of California") that shouldn't leak into the csv.
+ * falls back to the linkedin title only when department is also missing.
+ */
+function pickEnrichedRole(
+  currentRole: string | null | undefined,
+  department: string | null | undefined,
+  linkedinRole: string | null | undefined,
+): string | null {
+  if (!isSiteRolePlaceholder(currentRole)) return null;
+  const dept = department?.trim();
+  if (dept) return `${dept} Teacher`;
+  const li = linkedinRole?.trim();
+  if (li && li.length <= 120 && !isJustEmployerName(li)) return li;
+  return null;
+}
+
 function isJustEmployerName(role: string): boolean {
   const ORG_PATTERNS = /\b(school|schools|academy|university|college|institute|district|corporation|inc|corp|llc|foundation|center|centre)\b/i;
   const JOB_SIGNALS = /\b(teacher|faculty|instructor|professor|coach|director|coordinator|head|chair|dean|educator|tutor|specialist|researcher|scientist|engineer|developer|counselor|librarian|aide|assistant|associate|advisor|mentor|fellow|candidate|staff|admin|administrator|manager|superintendent|principal|department|teaching|math|science|computer|physics|chemistry|biology|engineering|robotics)\b/i;
@@ -768,14 +788,8 @@ async function enrichViaExaBatched(
     const role = picked.title ? parseExaTitle(picked.title).role : null;
 
     teacher.linkedinUrl = profileUrl;
-    // only fall back to the LinkedIn headline when the site gave us nothing
-    // useful — site roles are structured ("Mathematics Teacher, HS") while
-    // LinkedIn headlines are self-authored prose ("Math Teacher at Fairfax
-    // County Public Schools" / "Current Stats Teacher, Future Data Scientist")
-    // and overwriting the site role with those loses subject + grade signal.
-    if (role && isSiteRolePlaceholder(teacher.role) && role.length <= 120 && !isJustEmployerName(role)) {
-      teacher.role = role;
-    }
+    const pickedRole = pickEnrichedRole(teacher.role, teacher.department, role);
+    if (pickedRole) teacher.role = pickedRole;
     if (!teacher.sources.includes("linkedin")) {
       teacher.sources.push("linkedin");
     }
@@ -880,9 +894,8 @@ export async function enrichWithLinkedin(
         if (!original) continue;
 
         original.linkedinUrl = result.profileUrl;
-        if (result.title && isSiteRolePlaceholder(original.role) && result.title.length <= 120 && !isJustEmployerName(result.title)) {
-          original.role = result.title;
-        }
+        const pickedRole = pickEnrichedRole(original.role, original.department, result.title);
+        if (pickedRole) original.role = pickedRole;
         if (!original.sources.includes("linkedin")) {
           original.sources.push("linkedin");
         }

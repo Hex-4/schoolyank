@@ -346,6 +346,38 @@ export function validateTeachers(
   }
   teachers = [...seen.values()];
 
+  // step f.2: deduplicate by email. catches the maiden/married-name case where
+  // a directory lists the same person twice under different surnames ("Britton
+  // (aka Sanchez)" + "Sanchez (see Britton above)" → one row). name-dedup in
+  // step f can't catch this because the last names differ.
+  const byEmail = new Map<string, Teacher>();
+  const emailless: Teacher[] = [];
+  for (const t of teachers) {
+    if (!t.email) {
+      emailless.push(t);
+      continue;
+    }
+    const key = t.email.toLowerCase();
+    const existing = byEmail.get(key);
+    if (!existing || scoreTeacher(t) > scoreTeacher(existing)) {
+      byEmail.set(key, t);
+    }
+  }
+  teachers = [...byEmail.values(), ...emailless];
+
+  // step f.3: strip directory cross-reference annotations from role text.
+  // directories sometimes include inline notes like "(see Britton, Kathryn
+  // above)" or "(aka Sanchez)" alongside the actual role. these are metadata,
+  // not job titles, and shouldn't ship in the csv.
+  teachers = teachers.map((t) => {
+    if (!t.role) return t;
+    const cleaned = t.role
+      .replace(/\s*\((?:see|see also|aka|a\.?k\.?a\.?|formerly|née|nee|same as|previously)[^)]*\)/gi, "")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    return cleaned === t.role ? t : { ...t, role: cleaned };
+  });
+
   // derive the canonical email domain from the MAJORITY of teacher emails —
   // NOT from the scraped URL. URLs can be typo aliases (`cvs-dvt.org`) while
   // actual emails use the real domain (`@cvsdvt.org`). emails are ground truth.

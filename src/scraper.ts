@@ -310,6 +310,7 @@ If the directory page HTML contains \`class="fsConstituentItem"\`, it's a Finals
 - If organized by school or department, visit EVERY relevant section.
 - Click into individual profiles when emails or titles aren't on the listing page.
 - When in doubt about STEM, include — we'll filter later.
+- For districts with many per-school subsites (10+), prioritize BREADTH: hit 2-3 keyword sweeps (e.g. \`math\`, \`science\`, \`stem\`) across ALL schools before exhausting subject-by-subject sweeps on any one school. A district that ships 5 teachers per school × 30 schools beats 40 teachers from one school + 0 from the other 29. Do NOT stop after 3-5 schools and report "most had generic titles" — that's a coverage failure, not a finding.
 
 ━━ OUTPUT ━━
 

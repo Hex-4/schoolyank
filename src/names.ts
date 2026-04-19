@@ -163,16 +163,13 @@ export function canonicalizeDepartment(raw: string | null | undefined): string |
   if (/\b(biolog|anatomy|physiology|life science)/.test(lower)) return "Biology";
   if (/\b(environ)/.test(lower)) return "Environmental Science";
   if (/\b(earth science|geolog|astronomy)/.test(lower)) return "Earth Science";
-  if (/\b(tech|digital|it)\b/.test(lower)) return "Technology";
-  if (/\b(math)/.test(lower)) return "Mathematics";
+  if (/\b(tech(?:nology|nical|nician)?|digital|it)\b/.test(lower)) return "Technology";
+  if (/\b(math|algebra|geometry|calculus|precalc|trigonometry|trig|statistics|probability)/.test(lower)) return "Mathematics";
   if (/\b(science)\b/.test(lower)) return "Science";
 
   // nothing matched — return titlecased original so we at least don't ship
   // "MATHEMATICS" next to "Mathematics".
-  return s
-    .split(/\s+/)
-    .map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1).toLowerCase() : w))
-    .join(" ");
+  return toTitleCase(s);
 }
 
 const SMALL_WORDS = new Set([
@@ -180,18 +177,28 @@ const SMALL_WORDS = new Set([
   "of", "on", "or", "per", "the", "to", "vs", "via",
 ]);
 
+const ACRONYM_TOKENS = new Set([
+  "HS", "MS", "ES", "ELA", "IT", "CS", "PE", "AP", "IB",
+  "STEM", "STEAM", "ESL", "ELL", "ROTC", "JROTC", "CTE",
+  "US", "USA", "UK", "EU", "AI", "ML",
+]);
+
 function toTitleCase(s: string): string {
-  const words = s.toLowerCase().split(/(\s+|-)/);
+  const words = s.split(/(\s+|-|\/)/);
   return words
     .map((w, i) => {
       if (!w.trim()) return w;
-      if (w === "-") return w;
+      if (w === "-" || w === "/") return w;
+      if (ACRONYM_TOKENS.has(w)) return w;
+      const upper = w.toUpperCase();
+      if (ACRONYM_TOKENS.has(upper)) return upper;
+      const lower = w.toLowerCase();
       // preserve numbers and ordinal markers
-      if (/^\d/.test(w)) return w;
+      if (/^\d/.test(lower)) return lower;
       // short connectors stay lowercase except first/last token
       const isEdge = i === 0 || i === words.length - 1;
-      if (!isEdge && SMALL_WORDS.has(w)) return w;
-      return w.charAt(0).toUpperCase() + w.slice(1);
+      if (!isEdge && SMALL_WORDS.has(lower)) return lower;
+      return lower.charAt(0).toUpperCase() + lower.slice(1);
     })
     .join("");
 }

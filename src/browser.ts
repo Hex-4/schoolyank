@@ -262,3 +262,44 @@ export async function stopSession(
 ): Promise<void> {
   await client.sessions.stop(sessionId);
 }
+
+/**
+ * kill every non-terminal browser-use session on the current project.
+ *
+ * the free tier caps active sessions at 3. if a previous run was aborted
+ * (ctrl-c, crash, timeout) its sessions can linger past their idle timeout
+ * and burn that quota, so `sessions.create` on the next run returns a 429
+ * before the first task even starts. calling this at startup clears the
+ * decks idempotently.
+ *
+ * returns the count of sessions we actively asked to stop. errors on
+ * individual stops are swallowed — a session that already terminated on
+ * its own isn't a failure we care about here.
+ */
+export async function killActiveSessions(client: BrowserUse): Promise<number> {
+  let killed = 0;
+  try {
+    const response = await client.sessions.list({ page_size: 100 });
+    const sessions = (response as { sessions?: Array<{ id: string; status?: string }> }).sessions ?? [];
+    const active = sessions.filter((s) => {
+      const st = (s.status ?? "").toLowerCase();
+      return st !== "stopped" && st !== "timed_out" && st !== "error" && st !== "finished";
+    });
+    debug("BROWSER", `killActiveSessions · found ${active.length} active / ${sessions.length} total`);
+    await Promise.all(
+      active.map(async (s) => {
+        try {
+          await client.sessions.stop(s.id);
+          killed++;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          debug("BROWSER", `killActiveSessions · could not stop ${s.id}: ${msg}`);
+        }
+      }),
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    debug("BROWSER", `killActiveSessions · list failed: ${msg}`);
+  }
+  return killed;
+}

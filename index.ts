@@ -17,6 +17,7 @@ import { run, PHASE_LABELS, type PhaseId } from "./src/orchestrator";
 import { slugify } from "./src/utils";
 import { generateMergedCsv, writeCsv } from "./src/csv";
 import { missingRequiredEnv, runSetupWizard } from "./src/setup";
+import { createClient, killActiveSessions } from "./src/browser";
 import { debug } from "./src/debug";
 import type { ScrapeConfig, ScrapeResult, Teacher } from "./src/types";
 
@@ -859,6 +860,18 @@ async function runNonInteractive(flags: CliFlags): Promise<void> {
 	console.log(`${BRAND_TAG}  ${t.muted(`${items.length} school${items.length === 1 ? "" : "s"}, concurrency ${flags.concurrency}`)}`);
 	if (enableLinkedin && !process.env.EXA_API_KEY) {
 		console.log(t.warn("! linkedin enabled but EXA_API_KEY not set — falling back to DDG scrape (lower hit rate)"));
+	}
+
+	// clear any lingering browser-use sessions from previous runs before we
+	// spawn ours. the free tier caps at 3 concurrent sessions project-wide,
+	// and an aborted run can leave sessions active past their idle timeout
+	// — which would make the first createSession() of this run fail.
+	try {
+		const killed = await killActiveSessions(createClient());
+		if (killed > 0) console.log(t.muted(`cleared ${killed} lingering browser-use session${killed === 1 ? "" : "s"}`));
+	} catch (err) {
+		const msg = err instanceof Error ? err.message : String(err);
+		debug("INDEX", `killActiveSessions failed: ${msg}`);
 	}
 
 	const batchStart = Date.now();

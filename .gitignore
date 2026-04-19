@@ -31,6 +31,9 @@ profiles/
 .cache
 *.tsbuildinfo
 
+# iteration scratchpads (claude's recurse notes)
+RECURSE.md
+
 # IntelliJ based IDEs
 .idea
 
