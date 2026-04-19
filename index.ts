@@ -469,9 +469,13 @@ async function runInteractive(): Promise<void> {
 	// info already lands on stderr via the debug() calls we threaded through
 	// the pipeline, so nothing is lost.
 	const debugMode = process.env.SCHOOLYANK_DEBUG === "1";
+	// clack's default 80ms tick redraws the whole line 12×/sec — on some
+	// terminals the erase→rewrite has a visible gap and the line flickers.
+	// 100ms drops to 10/sec which is enough to settle on those terminals
+	// while keeping the spin motion snappy.
 	const spinner = debugMode
 		? { start: () => {}, stop: () => {}, message: () => {}, clear: () => {} }
-		: p.spinner();
+		: p.spinner({ delay: 100 });
 	spinner.start("starting scrape...");
 
 	// progress state: phase + latest substatus, combined into one spinner line
