@@ -405,6 +405,82 @@ function printHelp(): void {
 	console.log(lines.join("\n"));
 }
 
+// ── spinner ──────────────────────────────────────────────────────────────────
+
+interface Spinner {
+	start(msg?: string): void;
+	stop(msg?: string): void;
+	message(msg?: string): void;
+	clear(): void;
+}
+
+/**
+ * single-line spinner that writes at column 0 and erases only the trailing
+ * chars with `\x1b[K`. clack's built-in spinner uses the opposite order —
+ * cursor.to(0) + erase.down() BEFORE writing the new frame — which produces
+ * a visible "blank for a millisecond" flicker on some terminals. our
+ * write-first-then-erase order means the line is never visually empty.
+ *
+ * matches the 4-method subset of clack's SpinnerResult we actually use:
+ * start / stop / message / clear.
+ */
+function makeSpinner(output: NodeJS.WriteStream = process.stdout): Spinner {
+	// two braille cells side-by-side = a 4×4 dot grid. we draw a 4-dot
+	// "snake" crawling clockwise around the perimeter — 12 perimeter
+	// positions, head + 3-dot tail, new frame each tick. the motion wraps
+	// cleanly (bottom-left → left column → top-left …) so no rest frames
+	// are needed; it's one continuous loop.
+	const frames = [
+		"⡇⠀", "⠏⠀", "⠋⠁", "⠉⠉", "⠈⠙", "⠀⠹",
+		"⠀⢸", "⠀⣰", "⢀⣠", "⣀⣀", "⣄⡀", "⣆⠀",
+	];
+	const delay = 100;
+	let idx = 0;
+	let msg = "";
+	let running = false;
+	let timer: ReturnType<typeof setInterval> | null = null;
+
+	function render() {
+		idx = (idx + 1) % frames.length;
+		const frame = t.accent(frames[idx]!);
+		// \r = cursor to col 0; \x1b[K = erase from cursor to end of line.
+		// writing content first means the line is never blank between frames.
+		output.write(`\r${frame}  ${msg}\x1b[K`);
+	}
+
+	return {
+		start(initial = "") {
+			if (running) return;
+			// match clack's column gutter so the spinner line visually connects
+			// to the `◆`/`◇` symbols in the rest of the ui
+			output.write(`${t.muted("│")}\n`);
+			msg = initial;
+			idx = 0;
+			running = true;
+			render();
+			timer = setInterval(render, delay);
+		},
+		stop(final = "") {
+			if (!running) return;
+			running = false;
+			if (timer) clearInterval(timer);
+			timer = null;
+			const sym = t.ok("◇");
+			output.write(`\r${sym}  ${final}\x1b[K\n`);
+		},
+		message(next = "") {
+			msg = next;
+		},
+		clear() {
+			if (!running) return;
+			running = false;
+			if (timer) clearInterval(timer);
+			timer = null;
+			output.write(`\r\x1b[K`);
+		},
+	};
+}
+
 // ── main ─────────────────────────────────────────────────────────────────────
 
 async function runInteractive(): Promise<void> {
@@ -469,13 +545,15 @@ async function runInteractive(): Promise<void> {
 	// info already lands on stderr via the debug() calls we threaded through
 	// the pipeline, so nothing is lost.
 	const debugMode = process.env.SCHOOLYANK_DEBUG === "1";
-	// clack's default 80ms tick redraws the whole line 12×/sec — on some
-	// terminals the erase→rewrite has a visible gap and the line flickers.
-	// 100ms drops to 10/sec which is enough to settle on those terminals
-	// while keeping the spin motion snappy.
+	// custom spinner instead of p.spinner(). clack's spinner erases the line
+	// with cursor.to(0) + erase.down() BEFORE writing the new frame — on some
+	// terminals (older gnome-terminal, konsole, mintty) the gap between erase
+	// and write is visible as a flicker. our version writes the new content at
+	// col 0 first, then erases only the trailing chars (`\r<content>\x1b[K`),
+	// so there's never a moment where the line is blank.
 	const spinner = debugMode
 		? { start: () => {}, stop: () => {}, message: () => {}, clear: () => {} }
-		: p.spinner({ delay: 100 });
+		: makeSpinner();
 	spinner.start("starting scrape...");
 
 	// progress state: phase + latest substatus, combined into one spinner line
@@ -548,7 +626,11 @@ async function runInteractive(): Promise<void> {
 	}
 
 	/** format the phase indicator: `[3/6] extracting teachers` */
-	function formatPhasePrefix(phase: PhaseId, idx: number, total: number): string {
+	function formatPhasePrefix(
+		phase: PhaseId,
+		idx: number,
+		total: number,
+	): string {
 		return `${t.muted(`[${idx}/${total}]`)} ${t.bold(PHASE_LABELS[phase])}`;
 	}
 
@@ -710,14 +792,20 @@ async function scrapeOne(
 	outputPath: string,
 	tag: string,
 ): Promise<ScrapeResult> {
-	const scrapeConfig: ScrapeConfig = { schoolUrl: url, enableLinkedin, outputPath };
+	const scrapeConfig: ScrapeConfig = {
+		schoolUrl: url,
+		enableLinkedin,
+		outputPath,
+	};
 	return run(scrapeConfig, {
 		onStatus: (msg) => {
 			debug("STATUS", `${tag} ${msg}`);
 		},
 		onPhase: (phase, idx, total) => {
 			debug("PHASE", `${tag} → ${phase} [${idx}/${total}]`);
-			console.log(`${t.muted(tag)} ${t.muted(`[${idx}/${total}]`)} ${t.bold(PHASE_LABELS[phase])}`);
+			console.log(
+				`${t.muted(tag)} ${t.muted(`[${idx}/${total}]`)} ${t.bold(PHASE_LABELS[phase])}`,
+			);
 		},
 		onMilestone: (msg, level) => {
 			debug("MILESTONE", `${tag} [${level ?? "info"}] ${msg}`);
@@ -726,7 +814,9 @@ async function scrapeOne(
 		},
 		onLiveUrl: (liveUrl) => {
 			debug("LIVE-URL", `${tag} ${liveUrl}`);
-			console.log(`${t.muted(tag)} ${t.muted("watch live:")} ${t.brand(liveUrl)}`);
+			console.log(
+				`${t.muted(tag)} ${t.muted("watch live:")} ${t.brand(liveUrl)}`,
+			);
 		},
 	});
 }
@@ -750,7 +840,9 @@ async function runBatch(
 			const start = Date.now();
 
 			if (!force && existsSync(item.outputPath)) {
-				console.log(`${t.muted(tag)} ${t.muted("skipped (output exists — pass --force to re-scrape)")}`);
+				console.log(
+					`${t.muted(tag)} ${t.muted("skipped (output exists — pass --force to re-scrape)")}`,
+				);
 				outcomes[myIdx] = {
 					item,
 					status: "skipped",
@@ -768,7 +860,12 @@ async function runBatch(
 			let lastError = "";
 			for (let attempt = 1; attempt <= 2; attempt++) {
 				try {
-					const r = await scrapeOne(item.url, enableLinkedin, item.outputPath, tag);
+					const r = await scrapeOne(
+						item.url,
+						enableLinkedin,
+						item.outputPath,
+						tag,
+					);
 					// treat 0 teachers as a retry-eligible failure — it's almost always
 					// a transient scraper gave-up / browser-use flake, not a real
 					// empty district. a real empty district is vanishingly rare.
@@ -784,7 +881,9 @@ async function runBatch(
 				} catch (err) {
 					lastError = err instanceof Error ? err.message : String(err);
 					if (attempt === 1) {
-						console.log(`${t.muted(tag)} ${t.warn("! first attempt failed:")} ${lastError} ${t.muted("— retrying once")}`);
+						console.log(
+							`${t.muted(tag)} ${t.warn("! first attempt failed:")} ${lastError} ${t.muted("— retrying once")}`,
+						);
 					}
 				}
 			}
@@ -801,7 +900,9 @@ async function runBatch(
 					durationMs: Date.now() - start,
 				};
 			} else {
-				console.log(`${t.muted(tag)} ${t.bad("✗ failed (after retry):")} ${lastError}`);
+				console.log(
+					`${t.muted(tag)} ${t.bad("✗ failed (after retry):")} ${lastError}`,
+				);
 				outcomes[myIdx] = {
 					item,
 					status: "failed",
@@ -861,9 +962,15 @@ async function runNonInteractive(flags: CliFlags): Promise<void> {
 		return { url, outputPath, slug };
 	});
 
-	console.log(`${BRAND_TAG}  ${t.muted(`${items.length} school${items.length === 1 ? "" : "s"}, concurrency ${flags.concurrency}`)}`);
+	console.log(
+		`${BRAND_TAG}  ${t.muted(`${items.length} school${items.length === 1 ? "" : "s"}, concurrency ${flags.concurrency}`)}`,
+	);
 	if (enableLinkedin && !process.env.EXA_API_KEY) {
-		console.log(t.warn("! linkedin enabled but EXA_API_KEY not set — falling back to DDG scrape (lower hit rate)"));
+		console.log(
+			t.warn(
+				"! linkedin enabled but EXA_API_KEY not set — falling back to DDG scrape (lower hit rate)",
+			),
+		);
 	}
 
 	// clear any lingering browser-use sessions from previous runs before we
@@ -872,14 +979,24 @@ async function runNonInteractive(flags: CliFlags): Promise<void> {
 	// — which would make the first createSession() of this run fail.
 	try {
 		const killed = await killActiveSessions(createClient());
-		if (killed > 0) console.log(t.muted(`cleared ${killed} lingering browser-use session${killed === 1 ? "" : "s"}`));
+		if (killed > 0)
+			console.log(
+				t.muted(
+					`cleared ${killed} lingering browser-use session${killed === 1 ? "" : "s"}`,
+				),
+			);
 	} catch (err) {
 		const msg = err instanceof Error ? err.message : String(err);
 		debug("INDEX", `killActiveSessions failed: ${msg}`);
 	}
 
 	const batchStart = Date.now();
-	const outcomes = await runBatch(items, enableLinkedin, flags.concurrency, flags.force);
+	const outcomes = await runBatch(
+		items,
+		enableLinkedin,
+		flags.concurrency,
+		flags.force,
+	);
 	const batchDurationSec = ((Date.now() - batchStart) / 1000).toFixed(1);
 
 	// merged CSV for batches of 2+ (or always when --merged-output is passed)
@@ -888,8 +1005,13 @@ async function runNonInteractive(flags: CliFlags): Promise<void> {
 		const mergedPath = resolve(flags.mergedOutput ?? "output/all.csv");
 		const csv = generateMergedCsv(okOutcomes.map((o) => o.result!));
 		await writeCsv(mergedPath, csv);
-		const totalTeachers = okOutcomes.reduce((n, o) => n + o.result!.teachers.length, 0);
-		console.log(`${t.ok("✓")} merged csv: ${t.brand(mergedPath)} ${t.muted(`(${totalTeachers} teachers across ${okOutcomes.length} schools)`)}`);
+		const totalTeachers = okOutcomes.reduce(
+			(n, o) => n + o.result!.teachers.length,
+			0,
+		);
+		console.log(
+			`${t.ok("✓")} merged csv: ${t.brand(mergedPath)} ${t.muted(`(${totalTeachers} teachers across ${okOutcomes.length} schools)`)}`,
+		);
 	}
 
 	// summary
@@ -901,7 +1023,8 @@ async function runNonInteractive(flags: CliFlags): Promise<void> {
 		`${t.bold("batch summary")}  ${t.ok(`${ok} ok`)}  ${t.muted(`${skipped} skipped`)}  ${failed.length > 0 ? t.bad(`${failed.length} failed`) : t.muted("0 failed")}  ${t.muted(`${batchDurationSec}s total`)}`,
 	);
 	if (failed.length > 0) {
-		for (const f of failed) console.log(`  ${t.bad("✗")} ${f.item.url} — ${f.error}`);
+		for (const f of failed)
+			console.log(`  ${t.bad("✗")} ${f.item.url} — ${f.error}`);
 		process.exit(1);
 	}
 }
@@ -920,7 +1043,9 @@ async function main(): Promise<void> {
 	// subsequent import without needing to thread a flag through every layer.
 	if (flags.debug) {
 		process.env.SCHOOLYANK_DEBUG = "1";
-		console.error(`${t.muted("[DEBUG]")} ${t.bold("schoolyank debug mode enabled")} ${t.muted("— verbose output on stderr")}`);
+		console.error(
+			`${t.muted("[DEBUG]")} ${t.bold("schoolyank debug mode enabled")} ${t.muted("— verbose output on stderr")}`,
+		);
 		console.error(`${t.muted("[DEBUG]")} flags: ${JSON.stringify(flags)}`);
 	}
 
