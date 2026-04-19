@@ -8,6 +8,7 @@ import type {
   HackerScore,
 } from "./types";
 import { parseName, normalizeEmail } from "./utils";
+import { canonicalizeDepartment } from "./names";
 
 // ── stem keyword lists ──
 
@@ -30,6 +31,8 @@ const TECH_KEYWORDS = [
 const STEM_KEYWORDS = [...TECH_KEYWORDS, ...SCIENCE_KEYWORDS, ...MATH_KEYWORDS];
 
 // phrases that look like STEM but aren't
+const GENERIC_DEPT_LABELS = new Set(["Science", "STEM", "Technology"]);
+
 const FALSE_POSITIVE_PATTERNS = [
   /\bpolitical\s+science\b/i,
   /\bsocial\s+science\b/i,
@@ -50,6 +53,42 @@ const SCHOOL_NAME_MARKERS = [
   /\binstitute\b/i,
   /\bcampus\b/i,
 ];
+
+/**
+ * reconcile a scraper-assigned department with the subject(s) named in the
+ * role text. handles three failure modes:
+ *   1. dept is missing → derive from role text ("Math Teacher" → "Mathematics")
+ *   2. dept is non-STEM ("Grade 2") → swap in a STEM subject from the role
+ *   3. dept is STEM but doesn't match the role (andover: scraper stuffed
+ *      "Computer Science" into every teacher's dept even for pure math
+ *      instructors) → swap in the role-derived subject
+ * guard: never downgrade a specific subject to a generic label, and never
+ * override when the role text actually mentions the current dept.
+ */
+function reconcileDepartment(
+  department: string | null,
+  role: string | null | undefined,
+): string | null {
+  const fromRole = canonicalizeDepartment(role ?? null);
+
+  // case 1: no dept — fall back to role-derived dept only if it's STEM.
+  // canonicalizeDepartment title-cases unknown inputs (so "Teacher" → "Teacher"),
+  // which would pollute the dept column. require an actual STEM subject.
+  if (!department) return fromRole && isStemRole("", fromRole) ? fromRole : null;
+
+  if (!fromRole || !isStemRole("", fromRole) || fromRole === department) return department;
+
+  // case 2: current dept isn't STEM — always prefer role-derived STEM dept.
+  if (!isStemRole("", department)) return fromRole;
+
+  // case 3: current dept is STEM but role text disagrees. skip generic labels
+  // and bail if the role actually mentions the current dept's keywords.
+  if (GENERIC_DEPT_LABELS.has(fromRole)) return department;
+  const roleLower = (role ?? "").toLowerCase();
+  const deptWords = department.toLowerCase().split(" ").filter((w) => w.length > 2);
+  if (deptWords.some((w) => roleLower.includes(w))) return department;
+  return fromRole;
+}
 
 // ── public api ──
 
@@ -249,6 +288,13 @@ export function validateTeachers(
         department = null;
       }
 
+      // canonicalize dept label so "Math" and "Mathematics" don't coexist in
+      // the same CSV. runs after the school-name scrub so we don't canonicalize
+      // something that turned out to be a building name.
+      department = canonicalizeDepartment(department);
+
+      department = reconcileDepartment(department, r.role);
+
       return {
         firstName,
         lastName,
@@ -265,6 +311,18 @@ export function validateTeachers(
         _emailDomainMatch: emailDomainMatch,
       };
     });
+
+  // step c.5: reject records where the "name" is actually a course/subject
+  // (e.g. scraper extracted "Adv Algebra" as a teacher name) or the role is
+  // an email address (scraper column confusion)
+  teachers = teachers.filter((t) => {
+    const fullName = `${t.firstName} ${t.lastName}`.toLowerCase();
+    if (/^(adv(anced)?|ap|honors?|intro|pre)\s/i.test(fullName)) return false;
+    if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(t.role)) {
+      t.role = "";
+    }
+    return true;
+  });
 
   // step d: infer missing emails from detected patterns
   teachers = inferEmails(teachers);

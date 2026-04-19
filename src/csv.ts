@@ -71,8 +71,8 @@ function teacherToRow(teacher: Teacher, result: ScrapeResult): string {
   const schoolName =
     school?.name ?? teacher.schoolName ?? (district ? "" : result.schools[0]?.name ?? "");
 
-  // school_phone: teacher's school phone > empty
-  const schoolPhone = school?.phone ?? "";
+  // school_phone: teacher's school phone > district office phone > empty
+  const schoolPhone = school?.phone ?? district?.officePhone ?? "";
 
   // school_district column: prefer the top-level district, else the school's
   // nces-provided lea_name.

@@ -1,6 +1,7 @@
 // ── thin wrapper around an openai-compatible local endpoint ──
 
 import OpenAI from "openai";
+import { debug, debugBlock, isDebug } from "./debug";
 
 const BASE_URL = process.env.AI_BASE_URL ?? "http://localhost:20128/v1";
 const MODEL = process.env.AI_MODEL ?? "kr/claude-sonnet-4.5";
@@ -14,6 +15,12 @@ export const ai = new OpenAI({
 
 // send a system + user prompt and return the raw text reply
 export async function ask(system: string, user: string): Promise<string> {
+  if (isDebug()) {
+    debug("AI", `ask() → model=${MODEL} system=${system.length}c user=${user.length}c`);
+    debugBlock("AI", "system prompt", system);
+    debugBlock("AI", "user prompt", user);
+  }
+  const start = Date.now();
   const res = await ai.chat.completions.create({
     model: MODEL,
     messages: [
@@ -22,7 +29,9 @@ export async function ask(system: string, user: string): Promise<string> {
     ],
   });
 
-  return res.choices[0]?.message?.content ?? "";
+  const content = res.choices[0]?.message?.content ?? "";
+  debugBlock("AI", `response · ${((Date.now() - start) / 1000).toFixed(2)}s`, content);
+  return content;
 }
 
 // same as ask() but parses the response as JSON

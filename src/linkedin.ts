@@ -19,6 +19,7 @@
 
 import type { Teacher, ConfidenceScore } from "./types";
 import { judgeLinkedinCandidates, type LinkedinCandidate } from "./judge";
+import { debug, debugWarn } from "./debug";
 
 // DDG tuning — only used when EXA_API_KEY isn't set. DDG rate-limits parallel
 // queries from one IP aggressively (serves an "anomaly in your search query"
@@ -319,6 +320,32 @@ function phraseReferencesSchool(phrase: string, schoolName: string): boolean {
     if (upperWords.some((w) => targetAcronym.startsWith(w))) return true;
   }
 
+  return false;
+}
+
+/**
+ * detect linkedin "roles" that are really just the employer/school name with
+ * no actual job title. e.g. "The Loomis Chaffee School" — happens when someone's
+ * linkedin headline is just their current company.
+ */
+/**
+ * true when the site-scraped role is too generic to carry useful info on its
+ * own (blank, or a bare word like "Teacher" / "Staff"). these are the only
+ * cases where we should fall through to a LinkedIn headline — a structured
+ * site role like "Mathematics Teacher, HS" should always win because it's
+ * more authoritative than a self-authored LinkedIn bio.
+ */
+function isSiteRolePlaceholder(role: string | null | undefined): boolean {
+  if (!role) return true;
+  const trimmed = role.trim().toLowerCase();
+  if (trimmed.length === 0) return true;
+  return /^(teacher|educator|instructor|staff|faculty|employee|professional)s?$/.test(trimmed);
+}
+
+function isJustEmployerName(role: string): boolean {
+  const ORG_PATTERNS = /\b(school|schools|academy|university|college|institute|district|corporation|inc|corp|llc|foundation|center|centre)\b/i;
+  const JOB_SIGNALS = /\b(teacher|faculty|instructor|professor|coach|director|coordinator|head|chair|dean|educator|tutor|specialist|researcher|scientist|engineer|developer|counselor|librarian|aide|assistant|associate|advisor|mentor|fellow|candidate|staff|admin|administrator|manager|superintendent|principal|department|teaching|math|science|computer|physics|chemistry|biology|engineering|robotics)\b/i;
+  if (!JOB_SIGNALS.test(role) && ORG_PATTERNS.test(role)) return true;
   return false;
 }
 
@@ -644,13 +671,16 @@ async function enrichViaExaBatched(
       const teacher = queue[myIdx]!;
       const context = contextFor(teacher, fallbackContext);
       try {
-        buckets[myIdx] = await fetchLinkedinCandidatesViaExa(
+        const candidates = await fetchLinkedinCandidatesViaExa(
           teacher,
           context,
           exaKey,
         );
+        buckets[myIdx] = candidates;
+        debug("LINKEDIN", `exa · ${teacher.firstName} ${teacher.lastName} → ${candidates.length} candidates`, candidates.map((c) => ({ url: c.url, title: c.title })));
       } catch (err) {
         errors[myIdx] = err instanceof Error ? err : new Error(String(err));
+        debugWarn("LINKEDIN", `exa fetch failed · ${teacher.firstName} ${teacher.lastName}`, { err: err instanceof Error ? err.message : String(err) });
       }
     }
   }
@@ -738,7 +768,12 @@ async function enrichViaExaBatched(
     const role = picked.title ? parseExaTitle(picked.title).role : null;
 
     teacher.linkedinUrl = profileUrl;
-    if (role && role.length > teacher.role.length) {
+    // only fall back to the LinkedIn headline when the site gave us nothing
+    // useful — site roles are structured ("Mathematics Teacher, HS") while
+    // LinkedIn headlines are self-authored prose ("Math Teacher at Fairfax
+    // County Public Schools" / "Current Stats Teacher, Future Data Scientist")
+    // and overwriting the site role with those loses subject + grade signal.
+    if (role && isSiteRolePlaceholder(teacher.role) && role.length <= 120 && !isJustEmployerName(role)) {
       teacher.role = role;
     }
     if (!teacher.sources.includes("linkedin")) {
@@ -775,6 +810,8 @@ export async function enrichWithLinkedin(
 
   const exaKey = process.env.EXA_API_KEY?.trim();
   const useExa = !!exaKey;
+
+  debug("LINKEDIN", `enrichWithLinkedin · ${teachers.length} teachers, provider=${useExa ? "exa" : "ddg"}, fallbackContext="${fallbackContext}"`);
 
   // exa path uses a two-phase flow: (1) concurrent fetch of ALL candidates
   // passing cheap deterministic checks, (2) one LLM batch call to pick the
@@ -843,7 +880,7 @@ export async function enrichWithLinkedin(
         if (!original) continue;
 
         original.linkedinUrl = result.profileUrl;
-        if (result.title && result.title.length > original.role.length) {
+        if (result.title && isSiteRolePlaceholder(original.role) && result.title.length <= 120 && !isJustEmployerName(result.title)) {
           original.role = result.title;
         }
         if (!original.sources.includes("linkedin")) {

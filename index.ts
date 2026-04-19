@@ -2,6 +2,13 @@
 
 // ── schoolyank: extract STEM teacher data from any school website ──
 
+// force ipv4-first dns resolution. some upstreams (urban institute's nces
+// endpoints, in particular) advertise AAAA records on hosts whose ipv6 path
+// is unreachable from common home networks — bun's fetch then happy-eyeballs
+// to the broken ipv6 address and hangs until the per-request timeout.
+import dns from "node:dns";
+dns.setDefaultResultOrder("ipv4first");
+
 import * as p from "@clack/prompts";
 import color from "picocolors";
 import { resolve } from "node:path";
@@ -9,6 +16,8 @@ import { existsSync } from "node:fs";
 import { run, PHASE_LABELS, type PhaseId } from "./src/orchestrator";
 import { slugify } from "./src/utils";
 import { generateMergedCsv, writeCsv } from "./src/csv";
+import { missingRequiredEnv, runSetupWizard } from "./src/setup";
+import { debug } from "./src/debug";
 import type { ScrapeConfig, ScrapeResult, Teacher } from "./src/types";
 
 const ENV_FILE = resolve(".env");
@@ -282,6 +291,7 @@ interface CliFlags {
 	force: boolean;
 	help: boolean;
 	interactive: boolean;
+	debug: boolean;
 }
 
 function parseArgs(argv: string[]): CliFlags {
@@ -295,6 +305,7 @@ function parseArgs(argv: string[]): CliFlags {
 		force: false,
 		help: false,
 		interactive: false,
+		debug: false,
 	};
 
 	for (let i = 0; i < argv.length; i++) {
@@ -333,6 +344,9 @@ function parseArgs(argv: string[]): CliFlags {
 				break;
 			case "--interactive":
 				flags.interactive = true;
+				break;
+			case "--debug":
+				flags.debug = true;
 				break;
 			default:
 				// bare positional args are treated as URLs — lets the user do
@@ -374,6 +388,7 @@ function printHelp(): void {
 		`  ${t.brand("--concurrency, -j")} <n>  parallel workers in batch (default 3, browser-use free-tier cap)`,
 		`  ${t.brand("--force")}                re-scrape even if output csv already exists`,
 		`  ${t.brand("--interactive")}          force interactive prompt even when urls are passed`,
+		`  ${t.brand("--debug")}                print extremely detailed debug info (browser agent, llm, nces, etc.)`,
 		`  ${t.brand("--help, -h")}             show this message`,
 		"",
 		`${t.bold("EXAMPLES")}`,
@@ -433,9 +448,29 @@ async function runInteractive(): Promise<void> {
 	const domain = new URL(config.schoolUrl).hostname.replace(/^www\./, "");
 	const outputPath = resolve("output", `${slugify(domain)}.csv`);
 
+	if (existsSync(outputPath)) {
+		const overwrite = await p.confirm({
+			message: `${t.brand(outputPath)} already exists — overwrite?`,
+			initialValue: false,
+		});
+		if (p.isCancel(overwrite) || !overwrite) {
+			p.cancel("bailed, existing file kept");
+			process.exit(0);
+		}
+	}
+
 	p.log.info(`${t.muted("will write")} ${t.brand(outputPath)}`);
 
-	const spinner = p.spinner();
+	// in --debug mode the spinner's repeated redraws fight with the stderr
+	// debug firehose (agent messages, llm prompts, nces decisions) and the
+	// terminal ends up a scrambled mess. swap it for a no-op stub whose
+	// lifecycle calls (start/stop/message/clear) just return — phase + status
+	// info already lands on stderr via the debug() calls we threaded through
+	// the pipeline, so nothing is lost.
+	const debugMode = process.env.SCHOOLYANK_DEBUG === "1";
+	const spinner = debugMode
+		? { start: () => {}, stop: () => {}, message: () => {}, clear: () => {} }
+		: p.spinner();
 	spinner.start("starting scrape...");
 
 	// progress state: phase + latest substatus, combined into one spinner line
@@ -470,13 +505,41 @@ async function runInteractive(): Promise<void> {
 		return out + "…\x1b[0m";
 	}
 
+	// dedup + throttle spinner writes. agent messages arrive faster than the
+	// terminal can cleanly redraw, and when two substatuses alternate in quick
+	// succession the line visibly flickers. only push a new frame if the
+	// rendered string actually changed AND at least MIN_REFRESH_MS has elapsed
+	// since the last write (phase transitions bypass the throttle).
+	const MIN_REFRESH_MS = 120;
+	let lastRendered = "";
+	let lastRenderedAt = 0;
+	let pendingTimer: ReturnType<typeof setTimeout> | null = null;
+
 	/** render `[i/N] phase — substatus` into a single line for the spinner */
-	function refreshSpinner() {
+	function refreshSpinner(opts?: { immediate?: boolean }) {
 		const parts = [phasePrefix, lastSubstatus].filter(Boolean);
 		const combined = parts.join(t.muted(" — "));
-		// reserve a few cols for clack's spinner chrome (spinner char + margin)
 		const termWidth = process.stdout.columns ?? 80;
-		spinner.message(truncateAnsi(combined, Math.max(30, termWidth - 6)));
+		const next = truncateAnsi(combined, Math.max(30, termWidth - 6));
+		if (next === lastRendered) return;
+
+		const now = Date.now();
+		const elapsed = now - lastRenderedAt;
+		if (!opts?.immediate && elapsed < MIN_REFRESH_MS) {
+			if (pendingTimer) return;
+			pendingTimer = setTimeout(() => {
+				pendingTimer = null;
+				refreshSpinner({ immediate: true });
+			}, MIN_REFRESH_MS - elapsed);
+			return;
+		}
+		if (pendingTimer) {
+			clearTimeout(pendingTimer);
+			pendingTimer = null;
+		}
+		lastRendered = next;
+		lastRenderedAt = now;
+		spinner.message(next);
 	}
 
 	/** format the phase indicator: `[3/6] extracting teachers` */
@@ -533,6 +596,7 @@ async function runInteractive(): Promise<void> {
 
 		const result = await run(scrapeConfig, {
 			onStatus: (msg) => {
+				debug("STATUS", msg);
 				const cleaned = cleanSubstatus(msg);
 				// skip noisy agent chatter — keep the previous substatus visible
 				// instead of replacing it with uninformative text
@@ -542,11 +606,13 @@ async function runInteractive(): Promise<void> {
 				refreshSpinner();
 			},
 			onPhase: (phase, idx, total) => {
+				debug("PHASE", `→ ${phase} [${idx}/${total}]`);
 				phasePrefix = formatPhasePrefix(phase, idx, total);
 				lastSubstatus = ""; // clear per-phase substatus on transition
-				refreshSpinner();
+				refreshSpinner({ immediate: true });
 			},
 			onMilestone: (msg, level) => {
+				debug("MILESTONE", `[${level ?? "info"}] ${msg}`);
 				// clear → log → restart: spinner.clear() stops the interval
 				// without emitting the green ◇ "done" frame that spinner.stop()
 				// writes. we only want the persistent ● line, not a diamond
@@ -555,7 +621,8 @@ async function runInteractive(): Promise<void> {
 				if (level === "warn") p.log.warn(msg);
 				else p.log.info(t.muted(msg));
 				spinner.start(phasePrefix || "");
-				refreshSpinner();
+				lastRendered = ""; // spinner.start resets the line
+				refreshSpinner({ immediate: true });
 			},
 			onLiveUrl: (liveUrl) => {
 				spinner.stop("browser session started");
@@ -640,15 +707,20 @@ async function scrapeOne(
 ): Promise<ScrapeResult> {
 	const scrapeConfig: ScrapeConfig = { schoolUrl: url, enableLinkedin, outputPath };
 	return run(scrapeConfig, {
-		onStatus: () => {},
+		onStatus: (msg) => {
+			debug("STATUS", `${tag} ${msg}`);
+		},
 		onPhase: (phase, idx, total) => {
+			debug("PHASE", `${tag} → ${phase} [${idx}/${total}]`);
 			console.log(`${t.muted(tag)} ${t.muted(`[${idx}/${total}]`)} ${t.bold(PHASE_LABELS[phase])}`);
 		},
 		onMilestone: (msg, level) => {
+			debug("MILESTONE", `${tag} [${level ?? "info"}] ${msg}`);
 			const prefix = level === "warn" ? t.warn("!") : t.ok("•");
 			console.log(`${t.muted(tag)} ${prefix} ${msg}`);
 		},
 		onLiveUrl: (liveUrl) => {
+			debug("LIVE-URL", `${tag} ${liveUrl}`);
 			console.log(`${t.muted(tag)} ${t.muted("watch live:")} ${t.brand(liveUrl)}`);
 		},
 	});
@@ -691,7 +763,18 @@ async function runBatch(
 			let lastError = "";
 			for (let attempt = 1; attempt <= 2; attempt++) {
 				try {
-					result = await scrapeOne(item.url, enableLinkedin, item.outputPath, tag);
+					const r = await scrapeOne(item.url, enableLinkedin, item.outputPath, tag);
+					// treat 0 teachers as a retry-eligible failure — it's almost always
+					// a transient scraper gave-up / browser-use flake, not a real
+					// empty district. a real empty district is vanishingly rare.
+					if (r.teachers.length === 0 && attempt === 1) {
+						console.log(
+							`${t.muted(tag)} ${t.warn("! first attempt returned 0 teachers — retrying once")}`,
+						);
+						lastError = "0 teachers on first attempt";
+						continue;
+					}
+					result = r;
 					break;
 				} catch (err) {
 					lastError = err instanceof Error ? err.message : String(err);
@@ -815,14 +898,30 @@ async function main(): Promise<void> {
 		return;
 	}
 
-	// preflight: BROWSER_USE_API_KEY is the only truly required env var.
-	// fail fast with a clear message — crashing deep inside the sdk gives an
-	// opaque "unauthorized" error that judges and users struggle to diagnose.
-	if (!process.env.BROWSER_USE_API_KEY?.trim()) {
-		console.error(
-			`${t.bad("✗ missing BROWSER_USE_API_KEY")}\n\nto get one:\n  ${t.muted("•")} manually: sign up free at ${t.brand("https://browser-use.com")} and drop the key in ${t.brand(".env")}\n  ${t.muted("•")} or easier: ask claude / your favorite coding agent to "sign up for a browser-use.com api key and put it in .env" — it'll handle the whole thing\n\nformat:\n  ${t.brand("BROWSER_USE_API_KEY")}=bu_your_key_here\n`,
-		);
-		process.exit(1);
+	// set the debug env var BEFORE any pipeline code runs. the debug module
+	// reads this lazily per-call, so setting it here propagates to every
+	// subsequent import without needing to thread a flag through every layer.
+	if (flags.debug) {
+		process.env.SCHOOLYANK_DEBUG = "1";
+		console.error(`${t.muted("[DEBUG]")} ${t.bold("schoolyank debug mode enabled")} ${t.muted("— verbose output on stderr")}`);
+		console.error(`${t.muted("[DEBUG]")} flags: ${JSON.stringify(flags)}`);
+	}
+
+	// preflight: if the required keys aren't set, walk the user through the
+	// full interactive setup wizard. handles LLM provider selection, browser-use
+	// signup via their public challenge api, and (optionally) Exa signup via a
+	// temp email. at the end, .env is written and the scrape proceeds normally.
+	if (missingRequiredEnv().length > 0) {
+		try {
+			await runSetupWizard();
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.error(`${t.bad("✗ setup failed:")} ${msg}`);
+			console.error(
+				`\n${t.muted("you can manually populate .env and rerun. required keys:")}\n  ${t.brand("BROWSER_USE_API_KEY")}\n  ${t.brand("AI_BASE_URL")}, ${t.brand("AI_MODEL")}, ${t.brand("AI_API_KEY")}\n  ${t.brand("EXA_API_KEY")} ${t.muted("(optional — for LinkedIn enrichment)")}`,
+			);
+			process.exit(1);
+		}
 	}
 
 	const hasUrls = flags.urls.length > 0 || !!flags.urlsFile;

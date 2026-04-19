@@ -11,6 +11,7 @@
 // the keyword-based result, so a flaky endpoint never blocks the pipeline.
 
 import { askJson } from "./ai";
+import { debug, debugWarn } from "./debug";
 import type { HackerScore, Teacher } from "./types";
 
 // ── stem + hacker score batch ────────────────────────────────────────────────
@@ -41,6 +42,8 @@ For each teacher, decide TWO things:
      * Political science, social science, library science, sports/exercise science (these SOUND like science but aren't)
      * General elementary teachers with no STEM specialization in their title
      * Administrators with no subject-teaching role (principals, vice principals, superintendents, HR)
+     * Educational assistants, paraprofessionals, instructional aides — unless their title explicitly names a STEM subject (e.g. "Math Interventionist" is STEM, "Educational Assistant" is not)
+     * Administrative assistants, secretaries, office staff
      * Pure art/music teachers (but accept hybrids like "Art/STEM Teacher" or "Digital Art & Design Teacher")
 
 2. hackerScore (1-5): affinity for Hack Club's project-based hacker ethos. Score based on what they TEACH, not seniority:
@@ -55,13 +58,83 @@ Respond with valid JSON matching exactly:
 
 Include every teacher in results. No commentary, no markdown.`;
 
+// max teachers per judge call. large batches silently truncate or produce
+// partial results on typical LLM endpoints — keeping chunks small preserves
+// reliability on the 600+ teacher districts (hcpss) without losing the batch
+// efficiency for small ones.
+const JUDGE_CHUNK_SIZE = 100;
+
+type TeacherJudgeInput = {
+  firstName: string;
+  lastName: string;
+  role: string;
+  department: string | null;
+};
+
 /**
- * batch-classify teachers' STEM status + hacker score in a single LLM call.
- * returns null if the call fails or response is malformed — caller should
- * fall back to keyword-based scoring.
+ * batch-classify teachers' STEM status + hacker score. splits the input into
+ * chunks of JUDGE_CHUNK_SIZE and merges results, so a partial failure in one
+ * chunk doesn't kill the whole batch. returns null only if every chunk fails
+ * (caller falls back to keyword scoring for the whole list in that case —
+ * matches the original contract). if only some chunks fail, returns judgments
+ * for the successful chunks and keyword-fallback entries for the rest.
  */
 export async function judgeStemAndHacker(
-  teachers: { firstName: string; lastName: string; role: string; department: string | null }[],
+  teachers: TeacherJudgeInput[],
+): Promise<StemAndHackerJudgment[] | null> {
+  if (teachers.length === 0) return [];
+
+  const chunks: { start: number; items: TeacherJudgeInput[] }[] = [];
+  for (let i = 0; i < teachers.length; i += JUDGE_CHUNK_SIZE) {
+    chunks.push({ start: i, items: teachers.slice(i, i + JUDGE_CHUNK_SIZE) });
+  }
+
+  debug("JUDGE", `judgeStemAndHacker · ${teachers.length} teachers in ${chunks.length} chunk(s) of ≤${JUDGE_CHUNK_SIZE}`);
+
+  const merged: StemAndHackerJudgment[] = [];
+  let successfulChunks = 0;
+
+  const results = await Promise.all(
+    chunks.map((chunk) => judgeStemChunk(chunk.items)),
+  );
+
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c]!;
+    const out = results[c];
+    if (out) {
+      successfulChunks++;
+      for (const j of out) {
+        merged.push({
+          index: chunk.start + j.index,
+          isStem: j.isStem,
+          hackerScore: j.hackerScore,
+        });
+      }
+    } else {
+      // keyword fallback just for this chunk so downstream still gets a full
+      // judgment list. caller logs an aggregate warn if any chunks fell back.
+      for (let i = 0; i < chunk.items.length; i++) {
+        const t = chunk.items[i]!;
+        merged.push({
+          index: chunk.start + i,
+          isStem: keywordIsStem(t),
+          hackerScore: 1,
+        });
+      }
+    }
+  }
+
+  if (successfulChunks === 0) {
+    debugWarn("JUDGE", `judgeStemAndHacker · ALL ${chunks.length} chunk(s) failed — caller will fall back to keyword STEM filter`);
+    return null;
+  }
+  const stemCount = merged.filter((j) => j.isStem).length;
+  debug("JUDGE", `judgeStemAndHacker · ${successfulChunks}/${chunks.length} chunks ok, kept ${stemCount}/${merged.length} as STEM`);
+  return merged;
+}
+
+async function judgeStemChunk(
+  teachers: TeacherJudgeInput[],
 ): Promise<StemAndHackerJudgment[] | null> {
   if (teachers.length === 0) return [];
 
@@ -80,7 +153,6 @@ export async function judgeStemAndHacker(
 
     if (!res?.results || !Array.isArray(res.results)) return null;
 
-    // validate shape + clamp scores
     const valid: StemAndHackerJudgment[] = [];
     for (const r of res.results) {
       if (typeof r.index !== "number" || r.index < 0 || r.index >= teachers.length) continue;
@@ -94,14 +166,24 @@ export async function judgeStemAndHacker(
       });
     }
 
-    // require one judgment per teacher — partial results would silently drop
-    // teachers, worse than just falling back to keyword logic.
-    if (valid.length < teachers.length) return null;
-
+    if (valid.length < teachers.length) {
+      debugWarn("JUDGE", `stem chunk · only ${valid.length}/${teachers.length} valid entries in LLM response — rejecting chunk`);
+      return null;
+    }
+    debug("JUDGE", `stem chunk · ${valid.length}/${teachers.length} judgments (${valid.filter((v) => v.isStem).length} STEM)`);
     return valid;
-  } catch {
+  } catch (err) {
+    debugWarn("JUDGE", `stem chunk · threw ${err instanceof Error ? err.message : String(err)}`);
     return null;
   }
+}
+
+/** minimal keyword-based STEM check for chunk-level fallback */
+function keywordIsStem(t: TeacherJudgeInput): boolean {
+  const txt = `${t.role} ${t.department ?? ""}`.toLowerCase();
+  return /\b(math|science|stem|tech|comput|engineer|robot|physic|chem|biolog|coding|programming|digital)/.test(
+    txt,
+  );
 }
 
 // ── linkedin candidate validation batch ──────────────────────────────────────
@@ -143,6 +225,48 @@ Include every candidate. No commentary, no markdown.`;
  * back to accepting the keyword-passed candidates).
  */
 export async function judgeLinkedinCandidates(
+  candidates: LinkedinCandidate[],
+): Promise<LinkedinJudgment[] | null> {
+  if (candidates.length === 0) return [];
+
+  debug("JUDGE", `judgeLinkedinCandidates · ${candidates.length} candidates`);
+
+  const chunks: { start: number; items: LinkedinCandidate[] }[] = [];
+  for (let i = 0; i < candidates.length; i += JUDGE_CHUNK_SIZE) {
+    chunks.push({ start: i, items: candidates.slice(i, i + JUDGE_CHUNK_SIZE) });
+  }
+
+  const results = await Promise.all(
+    chunks.map((chunk) => judgeLinkedinChunk(chunk.items)),
+  );
+
+  const merged: LinkedinJudgment[] = [];
+  let successful = 0;
+  for (let c = 0; c < chunks.length; c++) {
+    const chunk = chunks[c]!;
+    const out = results[c];
+    if (out) {
+      successful++;
+      for (const j of out) merged.push({ index: chunk.start + j.index, isMatch: j.isMatch });
+    } else {
+      // conservative default when a chunk fails: mark every candidate as a
+      // non-match. linkedin enrichment is best-effort; a wrong linkedin_url
+      // is worse than a missing one.
+      for (let i = 0; i < chunk.items.length; i++) {
+        merged.push({ index: chunk.start + i, isMatch: false });
+      }
+    }
+  }
+
+  if (successful === 0) {
+    debugWarn("JUDGE", `judgeLinkedinCandidates · all chunks failed`);
+    return null;
+  }
+  debug("JUDGE", `judgeLinkedinCandidates · ${merged.filter((m) => m.isMatch).length}/${merged.length} matches accepted`);
+  return merged;
+}
+
+async function judgeLinkedinChunk(
   candidates: LinkedinCandidate[],
 ): Promise<LinkedinJudgment[] | null> {
   if (candidates.length === 0) return [];

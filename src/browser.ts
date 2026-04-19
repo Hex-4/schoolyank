@@ -2,6 +2,7 @@
 
 import { BrowserUse } from "browser-use-sdk/v3";
 import type { z } from "zod";
+import { debug, debugBlock, isDebug } from "./debug";
 
 export interface SessionInfo {
   id: string;
@@ -138,9 +139,17 @@ async function drainMessages(
   onMessage: (msg: string) => void,
 ): Promise<void> {
   let last = "";
+  let count = 0;
   for await (const msg of run) {
     const summary = (msg.summary ?? "").trim();
-    if (!summary || summary === last) continue;
+    if (!summary) continue;
+    count++;
+    // in debug mode, log EVERY agent message raw (including duplicates and
+    // noisy ones) — this is exactly the firehose users want to inspect.
+    if (isDebug()) {
+      debug("BROWSER", `msg #${count} role=${msg.role} noisy=${isNoisyAgentMessage(summary)}`, { summary });
+    }
+    if (summary === last) continue;
     last = summary;
     // drop agent-internal chatter (file I/O about its scratchpad, etc.)
     // before it can reach the spinner. the user wants actionable progress,
@@ -149,6 +158,7 @@ async function drainMessages(
     if (isNoisyAgentMessage(summary)) continue;
     onMessage(formatBrowserMessage(summary));
   }
+  debug("BROWSER", `stream drained: ${count} total messages`);
 }
 
 /**
@@ -163,15 +173,21 @@ export async function runTask(
 ): Promise<string> {
   const { onMessage, model } = options;
 
+  debugBlock("BROWSER", `runTask start · session=${sessionId} model=${model ?? "(default)"}`, prompt);
+  const taskStart = Date.now();
+
   try {
-    if (onMessage) {
+    if (onMessage || isDebug()) {
+      const sink = onMessage ?? (() => {});
       const run = client.run(prompt, {
         sessionId,
         ...(model && { model }),
       });
 
-      await drainMessages(run, onMessage);
-      return coerceOutput(run.result?.output);
+      await drainMessages(run, sink);
+      const output = coerceOutput(run.result?.output);
+      debugBlock("BROWSER", `runTask done · ${((Date.now() - taskStart) / 1000).toFixed(2)}s`, output);
+      return output;
     }
 
     const result = await client.run(prompt, {
@@ -181,6 +197,7 @@ export async function runTask(
     return coerceOutput(result.output);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    debug("BROWSER", `runTask FAILED · ${((Date.now() - taskStart) / 1000).toFixed(2)}s`, { error: message });
     throw new Error(`browser task failed: ${message}`);
   }
 }
@@ -199,20 +216,26 @@ export async function runTaskStructured<T extends z.ZodType>(
 ): Promise<z.output<T>> {
   const { onMessage, model } = options;
 
+  debugBlock("BROWSER", `runTaskStructured start · session=${sessionId} model=${model ?? "(default)"}`, prompt);
+  const taskStart = Date.now();
+
   try {
-    if (onMessage) {
+    if (onMessage || isDebug()) {
+      const sink = onMessage ?? (() => {});
       const run = client.run(prompt, {
         sessionId,
         schema,
         ...(model && { model }),
       });
 
-      await drainMessages(run, onMessage);
+      await drainMessages(run, sink);
       // structured runs return typed data in run.result.output
       const out = run.result?.output;
       if (out == null) {
+        debug("BROWSER", `runTaskStructured returned NULL · ${((Date.now() - taskStart) / 1000).toFixed(2)}s`);
         throw new Error("structured task returned null output");
       }
+      debug("BROWSER", `runTaskStructured done · ${((Date.now() - taskStart) / 1000).toFixed(2)}s`, out);
       return out as z.output<T>;
     }
 
@@ -227,6 +250,7 @@ export async function runTaskStructured<T extends z.ZodType>(
     return result.output as z.output<T>;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    debug("BROWSER", `runTaskStructured FAILED · ${((Date.now() - taskStart) / 1000).toFixed(2)}s`, { error: message });
     throw new Error(`browser task failed: ${message}`);
   }
 }

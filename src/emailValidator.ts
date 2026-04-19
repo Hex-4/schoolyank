@@ -18,6 +18,7 @@
 
 import { promises as dns } from "node:dns";
 import { Socket } from "node:net";
+import { debug, debugWarn } from "./debug";
 
 export type EmailStatus =
   | "valid" // RCPT TO returned 250
@@ -97,7 +98,6 @@ async function probeSmtpBatch(
   for (const host of mx) {
     const outcome = await runSession(
       host,
-      domain,
       emails,
       fromAddress,
       heloHost,
@@ -137,7 +137,6 @@ function tcpProbe(host: string, port: number, timeoutMs: number): Promise<boolea
  */
 function runSession(
   host: string,
-  domain: string,
   emails: string[],
   fromAddress: string,
   heloHost: string,
@@ -285,14 +284,19 @@ export async function validateEmailsBatched(
     byDomain.set(domain, list);
   }
 
+  debug("EMAIL", `validateEmailsBatched · ${emails.length} emails across ${byDomain.size} domain(s)`, Object.fromEntries([...byDomain.entries()].map(([d, e]) => [d, e.length])));
+
   // run domains in parallel; each domain runs sequentially internally (one
   // connection, N rcpts). most districts use 1-2 domains total.
   await Promise.all(
     [...byDomain.entries()].map(async ([domain, batch]) => {
+      const t0 = Date.now();
       try {
         const result = await probeSmtpBatch(domain, batch);
         for (const [email, status] of result) out.set(email, status);
-      } catch {
+        debug("EMAIL", `probed ${domain} · ${((Date.now() - t0) / 1000).toFixed(2)}s`, Object.fromEntries(result));
+      } catch (err) {
+        debugWarn("EMAIL", `probe threw for ${domain}`, { err: err instanceof Error ? err.message : String(err) });
         for (const email of batch) out.set(email, "inconclusive");
       }
     }),

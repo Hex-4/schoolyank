@@ -1,6 +1,7 @@
 // ── phase 1: school website scraping via browser-use ──
 
 import { z } from "zod";
+import { debug } from "./debug";
 import type { RawTeacherData, RawSiteInfo } from "./types";
 import {
   createClient,
@@ -81,6 +82,8 @@ function promptClassifySite(schoolUrl: string): string {
   return `Go to ${schoolUrl}.
 
 Your task: determine whether this URL is a SINGLE SCHOOL site or a SCHOOL DISTRICT site covering multiple schools, and extract identifying information about it.
+
+Before classifying: after the page loads, check the final URL in the address bar. If it differs from ${schoolUrl} (a 301/302 cross-domain redirect — e.g. bexleyschools.org → bexley.us — happens when a district has rebranded), treat the FINAL domain as the authoritative source for all subsequent navigation and email-domain inference. If the page loaded at ${schoolUrl} without redirecting, ignore this check and proceed normally — do NOT fabricate a redirect.
 
 ━━ CLASSIFICATION ━━
 
@@ -174,6 +177,7 @@ function promptFindStaffDirectory(siteType: "district" | "school"): string {
 3. Look for "Select a School" or school-picker widgets — these filter a district-wide table by school.
 4. Footer quick-links — directories are often duplicated there.
 5. Department-specific pages (Math, Science, STEM) sometimes list cross-school teachers.
+6. **Subdomain directories**: many districts host the canonical staff list on a SEPARATE subdomain like \`directory.<district>.org\`, \`staff.<district>.org\`, or \`people.<district>.org\`. If the main site has a top-nav "Directory" link that points to a different hostname (even same root domain), that IS the staff directory — follow it. Don't get stuck on the main www page when a dedicated subdomain exists.
 
 ━━ WHAT TO REPORT ━━
 
@@ -263,7 +267,7 @@ ${districtGuidance}
 ━━ FIELD RULES ━━
 
 - name: full name (first + last). Strip titles (Dr., Mr., Mrs., Ms.) and postnominals (Jr., PhD, MEd).
-- email: exact email address — mailto: links, on-page text, contact sections. Normalize obfuscated forms ("a [at] b [dot] edu" → "a@b.edu"). If no email is visible anywhere, set null — never guess.
+- email: exact email address — mailto: links, on-page text, contact sections. Normalize obfuscated forms ("a [at] b [dot] edu" → "a@b.edu"). If no email is visible anywhere, set null — never guess. **Returning teachers with email=null is always better than returning an empty teacher array** — downstream validation infers emails from the district's naming pattern when ≥3 real emails are seen, but it needs SOME teachers to work with. Never skip extracting a teacher just because their email isn't visible.
 - role: their job title as written ("AP Physics Teacher", "Math Department Chair"). What they DO.
 - department: SUBJECT only — "Science", "Mathematics", "STEM", "Computer Science", "Engineering", "Technology". NEVER a school name. NEVER a grade level. Infer from role if the site doesn't name a department.
 - phone: extension if listed next to the teacher. Don't invent.
@@ -277,14 +281,27 @@ ${districtGuidance}
 ❌ Never combine two real schools into one assignedSchool
 ❌ Never fabricate an email
 
+━━ IF THE PAGE LOOKS EMPTY — DON'T GIVE UP ━━
+
+Cheap HTTP fetches only return the raw HTML the server ships. Modern districts (Apptegy, React/Vue SPAs, etc.) ship a near-empty shell — something like \`<div id="app"></div>\` plus a few \`<script>\` tags — and the actual directory is rendered by JavaScript AFTER the page loads. If your first fetch returns:
+
+- a body that's mostly empty, or
+- an app shell with \`<div id="app">\`, \`<div id="root">\`, or similar single-div mount points, or
+- script tags pointing to \`/js/app.*.js\`, \`/static/js/main.*.js\`, chunk bundles, etc., or
+- a \`<noscript>\` tag saying "please enable JavaScript"
+
+…**do NOT conclude the page has no content.** Switch to the browser/navigate tool and wait for JS to hydrate the DOM before reading. The directory data is there, just not in the initial HTML.
+
+One extra try is cheap and often succeeds where the fetch tool fails. Returning 0 teachers because the raw HTML looked empty is almost always wrong — the correct response is "retry this URL in the browser".
+
 ━━ PLATFORM SHORTCUTS (save yourself iteration rounds) ━━
 
 If the directory page HTML contains \`class="fsConstituentItem"\`, it's a Finalsite directory (common for K-12 districts). Key facts:
 - the listing shows generic titles like "Teacher" without subjects — DO NOT rely on the listing view
 - use \`?const_search_keyword=<term>\` to reveal subject-specific titles (this searches both name AND title/profile fields)
 - sweep with ALL of these terms (do not skip any — each surfaces a different cohort): "math", "mathematics", "algebra", "geometry", "calculus", "statistics", "science", "biology", "chemistry", "physics", "environmental", "earth", "anatomy", "astronomy", "forensic", "computer", "computer science", "CS", "coding", "programming", "software", "tech ed", "technology", "IT", "digital", "stem", "engineering", "pre-engineering", "design technology", "maker", "robotics", "CAD", "drafting", "woodworking" — merge results by constituent ID. Missing ANY of these sweeps causes teachers to be silently dropped.
-- emails are JS-obfuscated: \`FS.util.insertEmail("elId", "<reversed domain>", "<reversed username>", true)\` — REVERSE BOTH to decode
-- paginate with \`?const_page=N\`; total count is in \`.fsPaginationLabel\`
+- emails are JS-obfuscated: \`FS.util.insertEmail("elId", "<reversed domain>", "<reversed username>", true)\` — REVERSE BOTH to decode. This is MANDATORY — do not leave emails blank on a Finalsite directory. Read the raw HTML (or the profile's detail page) and find the FS.util.insertEmail call for each teacher; the 2nd arg is the reversed domain, the 3rd is the reversed username. Reconstruct as \`<reversed(username)>@<reversed(domain)>\`. Example: \`FS.util.insertEmail("x","gro.elpmaxe","enaj.eod")\` → \`jane.doe@example.org\`. If you find teachers on a Finalsite site without also finding their FS.util.insertEmail calls, you're extracting from the wrong page — inspect the HTML source, not the rendered text.
+- paginate by CLICKING the "next page" anchor in the widget (some sites, e.g. newtrier.k12.il.us, ignore the \`?const_page=N\` query param on direct load — they only advance via the JS click handler). the anchor will have \`disabled="disabled"\` when there are no more pages. total count is in \`.fsPaginationLabel\`
 - do NOT paginate all pages if the directory has 500+ entries — targeted keyword searches are 10× faster than scanning 29 pages of generic titles
 
 ━━ COVERAGE ━━
@@ -336,9 +353,31 @@ export async function scrapeSchool(
   const milestone = options.onMilestone ?? (() => {});
   const onLiveUrl = options.onLiveUrl;
 
+  // ── Hasura bypass for Apptegy districts ──
+  // Apptegy-CMS districts (e.g. Academy District 20) ship a Vue SPA gated by
+  // reCAPTCHA, which blocks headless browsers. Their underlying Hasura GraphQL
+  // endpoint is unauthenticated and exposes names + emails + schools + subject
+  // teams. We auto-discover the endpoint (pattern + HTML-sniff) and hit it
+  // directly, skipping browser-use entirely. Pure speedup — any failure in
+  // detection falls through to the normal pipeline.
+  const { tryHasuraBypass } = await import("./hasuraBypass");
+  options.onScraperPhase?.("classify");
+  status("checking for Hasura fast-path...");
+  const bypassResult = await tryHasuraBypass(schoolUrl, (msg) => milestone(msg));
+  if (bypassResult && bypassResult.teachers.length > 0) {
+    options.onScraperPhase?.("extract");
+    milestone(
+      `extracted ${bypassResult.teachers.length} teacher candidates via Hasura GraphQL (bypassed browser agent)`,
+    );
+    return bypassResult;
+  }
+
+  debug("SCRAPER", `scrapeSchool → ${schoolUrl}`);
+
   const client = createClient();
   const session = await createSession(client);
   const { id: sessionId, liveUrl } = session;
+  debug("SCRAPER", `created session · id=${sessionId} liveUrl=${liveUrl || "(none)"}`);
 
   if (liveUrl) onLiveUrl?.(liveUrl);
 
@@ -346,13 +385,27 @@ export async function scrapeSchool(
     // task 1 — classify the site (structured output)
     options.onScraperPhase?.("classify");
     status("classifying site (district vs single school)...");
-    const rawSite = await runTaskStructured(
-      client,
-      sessionId,
-      promptClassifySite(schoolUrl),
-      SiteInfoSchema,
-      { onMessage: options.onStatus, model: SCRAPER_MODEL_DEFAULT },
-    );
+    let rawSite: z.output<typeof SiteInfoSchema>;
+    try {
+      rawSite = await runTaskStructured(
+        client,
+        sessionId,
+        promptClassifySite(schoolUrl),
+        SiteInfoSchema,
+        { onMessage: options.onStatus, model: SCRAPER_MODEL_DEFAULT },
+      );
+    } catch (classifyErr) {
+      debug("SCRAPER", `classify failed with ${SCRAPER_MODEL_DEFAULT}, retrying with ${SCRAPER_MODEL_EXTRACT}`, classifyErr);
+      status(`classify failed with ${SCRAPER_MODEL_DEFAULT}, retrying with ${SCRAPER_MODEL_EXTRACT}...`);
+      rawSite = await runTaskStructured(
+        client,
+        sessionId,
+        promptClassifySite(schoolUrl),
+        SiteInfoSchema,
+        { onMessage: options.onStatus, model: SCRAPER_MODEL_EXTRACT },
+      );
+    }
+    debug("SCRAPER", `classify result`, rawSite);
     // defensive: strip umbrella labels from the schools list so the extractor
     // doesn't treat them as valid per-teacher assignment targets. two sources
     // of truth:
@@ -384,6 +437,7 @@ export async function scrapeSchool(
       });
 
       if (members.length >= 1) {
+        debug("SCRAPER", `auto-detected umbrella "${s}" → members=${JSON.stringify(members)}`);
         autoDetectedGroups.push({ umbrella: s, members });
         reportedUmbrellas.add(norm);
       }
@@ -415,6 +469,7 @@ export async function scrapeSchool(
             UmbrellaMembersSchema,
             { onMessage: options.onStatus, model: SCRAPER_MODEL_DEFAULT },
           );
+          debug("SCRAPER", `umbrella probe "${candidate}"`, probe);
           if (probe.isUmbrella && probe.members.length >= 2) {
             probedGroups.push({ umbrella: candidate, members: probe.members });
             milestone(
@@ -481,10 +536,19 @@ export async function scrapeSchool(
     // used only as navigation context for the agent on its next task)
     options.onScraperPhase?.("directory");
     status("finding staff directory...");
-    await runTask(client, sessionId, promptFindStaffDirectory(siteInfo.siteType), {
-      onMessage: options.onStatus,
-      model: SCRAPER_MODEL_DEFAULT,
-    });
+    try {
+      await runTask(client, sessionId, promptFindStaffDirectory(siteInfo.siteType), {
+        onMessage: options.onStatus,
+        model: SCRAPER_MODEL_DEFAULT,
+      });
+    } catch (dirErr) {
+      debug("SCRAPER", `directory failed with ${SCRAPER_MODEL_DEFAULT}, retrying with ${SCRAPER_MODEL_EXTRACT}`, dirErr);
+      status(`directory failed with ${SCRAPER_MODEL_DEFAULT}, retrying with ${SCRAPER_MODEL_EXTRACT}...`);
+      await runTask(client, sessionId, promptFindStaffDirectory(siteInfo.siteType), {
+        onMessage: options.onStatus,
+        model: SCRAPER_MODEL_EXTRACT,
+      });
+    }
 
     // task 3 — extract stem teachers (structured output)
     options.onScraperPhase?.("extract");
@@ -496,6 +560,7 @@ export async function scrapeSchool(
       TeachersSchema,
       { onMessage: options.onStatus, model: SCRAPER_MODEL_EXTRACT },
     );
+    debug("SCRAPER", `extract raw result · ${extraction.teachers.length} teachers`, extraction);
 
     // normalize to our RawTeacherData shape (strip nulls where our type expects undefined)
     const teachers: RawTeacherData[] = extraction.teachers.map((t) => ({

@@ -33,6 +33,16 @@ function titleCase(s: string): string {
 export function parseName(fullName: string): { firstName: string; lastName: string } {
   let name = fullName.trim();
 
+  // strip alumni class years ANYWHERE in the string before other parsing.
+  // lawrenceville.org and peer prep schools often write "Daniel Concepcion '02"
+  // (or the curly-quote variant); without this the year ends up kept as the
+  // last name, or flipped into the first name if a trailing comma triggers
+  // the "Last, First" branch.
+  name = name.replace(/\s+['\u2019]\d{2}\b/g, "");
+
+  // strip parenthesized segments (maiden names, alternate spellings, nicknames)
+  name = name.replace(/\s*\([^)]*\)\s*/g, " ").trim();
+
   // strip prefixes and suffixes
   name = name.replace(PREFIXES, "");
   while (SUFFIXES.test(name)) name = name.replace(SUFFIXES, "");

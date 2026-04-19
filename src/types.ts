@@ -39,6 +39,7 @@ export interface DistrictInfo {
   leaId: string | null;
   url: string;
   officeAddress: Address | null;
+  officePhone: string | null;
 }
 
 export interface Address {
@@ -100,6 +101,22 @@ export interface RawSiteInfo {
   // so we use these mappings as a matcher fallback when a specific school
   // can't be found directly in the NCES roster.
   schoolGroups?: Array<{ umbrella: string; members: string[] }>;
+}
+
+// nces district (LEA) directory endpoint shape (subset). note the district
+// endpoint has different field set than the school endpoint — no ncessch,
+// different location fields, different phone.
+export interface NCESDistrictRecord {
+  lea_name: string;
+  leaid: string;
+  state_location: string;
+  street_mailing: string;
+  city_mailing: string;
+  state_mailing: string;
+  zip_mailing: string;
+  street_location: string;
+  city_location: string;
+  phone: string;
 }
 
 // nces api response shape (subset of fields we care about)
